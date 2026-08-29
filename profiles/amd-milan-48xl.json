@@ -1,0 +1,12 @@
+{
+  "name": "amd-milan-48xl",
+  "description": "AMD EPYC 7R13 (Milan) metal, dual socket. c6a/m6a/r6a .metal. SMT ON from the vendor, so nosmt actually does work here.",
+  "vendor": "amd",
+  "vcpus": 192,
+  "sockets": 2,
+  "cores_per_socket": 48,
+  "threads_per_core": 2,
+  "numa_nodes": 2,
+  "cores_per_l3": 8,
+  "nic_numa_node": 0
+}

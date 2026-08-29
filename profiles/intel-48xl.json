@@ -1,0 +1,12 @@
+{
+  "name": "intel-48xl",
+  "description": "Intel Sapphire Rapids metal, dual socket. c7i/m7i/r7i .metal-48xl",
+  "vendor": "intel",
+  "vcpus": 192,
+  "sockets": 2,
+  "cores_per_socket": 48,
+  "threads_per_core": 2,
+  "numa_nodes": 2,
+  "cores_per_l3": 48,
+  "nic_numa_node": 0
+}

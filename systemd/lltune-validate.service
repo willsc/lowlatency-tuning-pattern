@@ -1,0 +1,15 @@
+[Unit]
+Description=lltune post-boot verification of the low-latency configuration
+After=lltune-runtime.service
+Requires=lltune-runtime.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/lowlatency-tuning-pattern/bin/lltune validate --quiet
+# Report only. A failed check must not stop the node from serving; alert on it instead.
+SuccessExitStatus=0 1
+StandardOutput=journal
+Slice=system.slice
+
+[Install]
+WantedBy=multi-user.target

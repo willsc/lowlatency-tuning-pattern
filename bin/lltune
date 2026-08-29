@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""
+lltune - low-latency core plan / boot config / runtime tuning for AWS metal.
+
+Layers, in the order they must be applied:
+
+  1. plan      : decide which physical core does what (pure computation, no side effects)
+  2. boot      : GRUB cmdline  - isolcpus / nohz_full / rcu_nocbs / nosmt / numa_balancing  (needs reboot)
+  3. cgroup    : systemd slices - system.slice, irqnet.slice, pulsar.slice{,-exclusive,-shared}
+  4. runtime   : IRQ affinity, ENA queues, workqueues, governor, THP  (every boot)
+  5. validate  : prove all four actually took effect
+
+The plan is the single source of truth. Everything else is rendered from it, so
+boot args, cgroups, IRQ pinning and the app's core lists can never drift apart.
+"""
+
+import argparse, json, os, re, subprocess, sys, glob
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+STATE = Path("/etc/lowlatency")
+PLAN_PATH = STATE / "plan.json"
+
+# ---------------------------------------------------------------- cpu list utils
+
+def compress(cpus):
+    """[0,1,2,5,7,8] -> '0-2,5,7-8'"""
+    cpus = sorted(set(int(c) for c in cpus))
+    if not cpus:
+        return ""
+    out, start, prev = [], cpus[0], cpus[0]
+    for c in cpus[1:]:
+        if c == prev + 1:
+            prev = c
+            continue
+        out.append(f"{start}-{prev}" if start != prev else f"{start}")
+        start = prev = c
+    out.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return ",".join(out)
+
+
+def expand(spec):
+    """'0-2,5' -> [0,1,2,5]"""
+    cpus = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            cpus.extend(range(int(a), int(b) + 1))
+        else:
+            cpus.append(int(part))
+    return sorted(set(cpus))
+
+
+# ---------------------------------------------------------------- topology
+
+def topology_from_profile(profile):
+    """Synthesise the EC2 metal CPU enumeration from a profile descriptor.
+
+    EC2 numbers primary threads 0..(cores-1) socket by socket, then every sibling
+    thread in the same order: on a 2s x 24c x 2t host node0 is 0-23,48-71.
+    """
+    s = profile["sockets"]
+    cps = profile["cores_per_socket"]
+    tpc = profile["threads_per_core"]
+    nodes = profile["numa_nodes"]
+    l3 = profile.get("cores_per_l3", cps)
+    total = s * cps
+    if total % nodes:
+        raise SystemExit(f"{profile['name']}: {total} cores does not divide into {nodes} NUMA nodes")
+    per_node = total // nodes
+
+    cores = []
+    for i in range(total):
+        threads = [i] + [i + total * t for t in range(1, tpc)]
+        cores.append({
+            "core": i,
+            "socket": i // cps,
+            "node": i // per_node,
+            "l3": i // l3,
+            "threads": threads,
+        })
+    return {
+        "source": "profile:" + profile["name"],
+        "vendor": profile["vendor"],
+        "sockets": s,
+        "numa_nodes": nodes,
+        "threads_per_core": tpc,
+        "total_cores": total,
+        "total_cpus": total * tpc,
+        "cores_per_l3": l3,
+        "nic_numa_node": profile.get("nic_numa_node", 0),
+        "cores": cores,
+    }
+
+
+def _read(path, default=None):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        if default is None:
+            raise
+        return default
+
+
+def topology_live():
+    """Read the real topology out of sysfs. Authoritative; always prefer this on the host."""
+    cpu_dirs = sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*"),
+                      key=lambda p: int(re.search(r"cpu(\d+)$", p).group(1)))
+    by_core = {}
+    for d in cpu_dirs:
+        cpu = int(re.search(r"cpu(\d+)$", d).group(1))
+        topo = Path(d) / "topology"
+        if not topo.exists():
+            continue  # offline cpu
+        pkg = int(_read(topo / "physical_package_id", "0"))
+        core_id = int(_read(topo / "core_id", "0"))
+        node = 0
+        for nd in glob.glob("/sys/devices/system/node/node[0-9]*"):
+            if cpu in expand(_read(Path(nd) / "cpulist", "")):
+                node = int(re.search(r"node(\d+)$", nd).group(1))
+                break
+        l3 = None
+        for idx in glob.glob(f"{d}/cache/index*"):
+            if _read(Path(idx) / "level", "") == "3":
+                l3 = int(_read(Path(idx) / "id", "0"))
+        key = (pkg, core_id)
+        e = by_core.setdefault(key, {"socket": pkg, "node": node, "l3": l3, "threads": []})
+        e["threads"].append(cpu)
+
+    cores = []
+    for i, (key, e) in enumerate(sorted(by_core.items(), key=lambda kv: min(kv[1]["threads"]))):
+        e["threads"].sort()
+        cores.append({"core": i, "socket": e["socket"], "node": e["node"],
+                      "l3": e["l3"] if e["l3"] is not None else e["socket"],
+                      "threads": e["threads"]})
+
+    tpc = max(len(c["threads"]) for c in cores)
+    l3_sizes = {}
+    for c in cores:
+        l3_sizes[c["l3"]] = l3_sizes.get(c["l3"], 0) + 1
+
+    vendor = "amd" if "AMD" in _read("/proc/cpuinfo", "") else "intel"
+    return {
+        "source": "live",
+        "vendor": vendor,
+        "sockets": len({c["socket"] for c in cores}),
+        "numa_nodes": len({c["node"] for c in cores}),
+        "threads_per_core": tpc,
+        "total_cores": len(cores),
+        "total_cpus": sum(len(c["threads"]) for c in cores),
+        "cores_per_l3": min(l3_sizes.values()) if l3_sizes else len(cores),
+        "nic_numa_node": nic_numa_node(),
+        "cores": cores,
+    }
+
+
+def nic_numa_node(iface=None):
+    iface = iface or primary_iface()
+    if not iface:
+        return 0
+    n = _read(f"/sys/class/net/{iface}/device/numa_node", "0")
+    try:
+        return max(0, int(n))
+    except ValueError:
+        return 0
+
+
+def primary_iface():
+    for p in sorted(glob.glob("/sys/class/net/*")):
+        name = os.path.basename(p)
+        if name == "lo" or not os.path.exists(f"{p}/device"):
+            continue
+        return name
+    return None
+
+
+# ---------------------------------------------------------------- planner
+
+def clamp_count(n_cores, spec):
+    return max(spec["min"], min(spec["max"], round(n_cores * spec["ratio"])))
+
+
+def build_plan(topo, policy, profile_name=None):
+    tpc = topo["threads_per_core"]
+    smt_off = policy.get("smt", "off") == "off"
+    # When SMT is disabled at boot the sibling threads never come online, so every
+    # emitted list uses primary threads only. Handing offline CPUs to irqaffinity or
+    # to a cpuset is how you get silent, confusing failures.
+    def cpus_of(core):
+        return [core["threads"][0]] if smt_off else list(core["threads"])
+
+    nodes = sorted({c["node"] for c in topo["cores"]})
+    roles = {r: [] for r in ("housekeeping", "irqnet", "shared", "exclusive")}
+    per_node = []
+
+    for node in nodes:
+        cores = sorted([c for c in topo["cores"] if c["node"] == node],
+                       key=lambda c: (c["l3"], c["core"]))
+        n = len(cores)
+        hk = clamp_count(n, policy["housekeeping"])
+        irq = clamp_count(n, policy["irqnet"])
+        shared = max(1, round(n * policy["shared_ratio"]))
+        non_iso = hk + irq + shared
+
+        l3sz = topo.get("cores_per_l3", n)
+        if policy.get("l3_align") and 0 < l3sz < n:
+            # Round the non-isolated block up to a whole L3/CCX domain: an exclusive
+            # core must never share last-level cache with housekeeping or IRQ work.
+            aligned = -(-non_iso // l3sz) * l3sz
+            if aligned <= n * (1 - policy["min_exclusive_ratio"]):
+                shared += aligned - non_iso
+                non_iso = aligned
+
+        max_non_iso = int(n * (1 - policy["min_exclusive_ratio"]))
+        if non_iso > max_non_iso:
+            raise SystemExit(
+                f"node{node}: policy wants {non_iso}/{n} non-isolated cores, "
+                f"min_exclusive_ratio={policy['min_exclusive_ratio']} allows {max_non_iso}. "
+                f"Lower shared_ratio or min_exclusive_ratio.")
+
+        cuts = {"housekeeping": cores[:hk],
+                "irqnet": cores[hk:hk + irq],
+                "shared": cores[hk + irq:non_iso],
+                "exclusive": cores[non_iso:]}
+
+        entry = {"node": node, "cores_total": n}
+        for role, sel in cuts.items():
+            roles[role].extend(sel)
+            cpus = [cpu for c in sel for cpu in cpus_of(c)]
+            entry[role] = {"count": len(sel), "cpus": compress(cpus)}
+        per_node.append(entry)
+
+    if 0 not in [cpu for c in roles["housekeeping"] for cpu in cpus_of(c)]:
+        raise SystemExit("cpu0 must be housekeeping; refusing plan (check core enumeration)")
+
+    role_cpus = {r: sorted(cpu for c in cs for cpu in cpus_of(c)) for r, cs in roles.items()}
+    isolated = role_cpus["exclusive"]
+    non_isolated = sorted(role_cpus["housekeeping"] + role_cpus["irqnet"] + role_cpus["shared"])
+    housekeeping_all = sorted(role_cpus["housekeeping"] + role_cpus["irqnet"])
+
+    plan = {
+        "version": 1,
+        "profile": profile_name or topo["source"],
+        "topology": {k: topo[k] for k in
+                     ("source", "vendor", "sockets", "numa_nodes", "threads_per_core",
+                      "total_cores", "total_cpus", "cores_per_l3", "nic_numa_node")},
+        "policy": {k: v for k, v in policy.items() if not k.startswith(("_", "$"))},
+        "nodes": per_node,
+        "roles": {r: {"core_count": len(roles[r]), "cpu_count": len(role_cpus[r]),
+                      "cpus": compress(role_cpus[r])} for r in roles},
+        "isolated_cpus": compress(isolated),
+        "non_isolated_cpus": compress(non_isolated),
+        "irq_landing_cpus": compress(housekeeping_all),
+        "memory_nodes": compress(nodes),
+    }
+    plan["cmdline"] = build_cmdline(plan, topo, policy)
+    plan["app"] = build_app_contract(plan)
+    return plan
+
+
+def build_cmdline(plan, topo, policy):
+    iso = plan["isolated_cpus"]
+    args = []
+    if policy.get("smt", "off") == "off" and topo["threads_per_core"] > 1:
+        # nosmt is a no-op on AMD 7a-family (AWS ships those with SMT already off).
+        args.append("nosmt=force")
+
+    # --- isolation core ---
+    args += [
+        f"isolcpus=managed_irq,domain,{iso}",
+        f"nohz_full={iso}",
+        f"rcu_nocbs={iso}",
+        f"irqaffinity={plan['irq_landing_cpus']}",
+        "nohz=on",
+    ]
+    if policy.get("rcu_nocb_poll"):
+        args.append("rcu_nocb_poll")
+
+    # --- scheduler / NUMA ---
+    args += ["numa_balancing=disable", "skew_tick=1"]
+
+    # --- timers, watchdogs, noise ---
+    args += ["nmi_watchdog=0", "nosoftlockup", "mce=ignore_ce",
+             "tsc=reliable", "clocksource=tsc", "audit=0",
+             "rcupdate.rcu_normal_after_boot=1"]
+
+    # --- power / frequency determinism ---
+    cmax = policy.get("cstate_max", 1)
+    args.append(f"processor.max_cstate={cmax}")
+    if topo["vendor"] == "intel":
+        args.append(f"intel_idle.max_cstate={cmax}")
+    args.append("cpufreq.default_governor=performance")
+    if policy.get("idle_poll"):
+        args.append("idle=poll")
+
+    # --- memory ---
+    args.append("transparent_hugepage=never")
+    hp = policy.get("hugepages_1g_per_node", 0)
+    if hp:
+        args += ["default_hugepagesz=1G", "hugepagesz=1G",
+                 f"hugepages={hp * topo['numa_nodes']}"]
+
+    # --- io / pci ---
+    args += ["pcie_aspm=off", "iommu=pt"]
+
+    # --- cgroup v2 for the slice layer ---
+    args += ["systemd.unified_cgroup_hierarchy=1", "cgroup_no_v1=all"]
+
+    if policy.get("mitigations_off"):
+        args.append("mitigations=off")
+
+    return " ".join(args)
+
+
+def build_app_contract(plan):
+    """What the application reads. exclusive_cores == isolated, shared_cores == non-isolated app pool."""
+    app = {
+        "exclusive_cores": plan["roles"]["exclusive"]["cpus"],
+        "shared_cores": plan["roles"]["shared"]["cpus"],
+        "exclusive_core_count": plan["roles"]["exclusive"]["cpu_count"],
+        "shared_core_count": plan["roles"]["shared"]["cpu_count"],
+        "per_node": {},
+    }
+    for n in plan["nodes"]:
+        app["per_node"][str(n["node"])] = {
+            "exclusive_cores": n["exclusive"]["cpus"],
+            "shared_cores": n["shared"]["cpus"],
+        }
+    return app
+
+
+# ---------------------------------------------------------------- renderers
+
+def render_grub(plan):
+    return (
+        "# Managed by lltune. Regenerate with: lltune render\n"
+        "# Do not hand-edit; edit profiles/policy.json and re-render.\n"
+        f'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT {plan["cmdline"]}"\n'
+    )
+
+
+SLICE_HEADER = "# Managed by lltune. Regenerate with: lltune render\n"
+
+
+def render_slices(plan):
+    hk = plan["roles"]["housekeeping"]["cpus"]
+    irq = plan["roles"]["irqnet"]["cpus"]
+    shared = plan["roles"]["shared"]["cpus"]
+    excl = plan["roles"]["exclusive"]["cpus"]
+    app_all = compress(expand(shared) + expand(excl))
+    mem = plan["memory_nodes"]
+    out = {}
+
+    # Everything systemd owns by default gets squeezed onto housekeeping.
+    for unit in ("system.slice", "user.slice", "machine.slice", "init.scope"):
+        out[f"{unit}.d/10-lowlatency.conf"] = (
+            SLICE_HEADER +
+            f"[{'Scope' if unit.endswith('.scope') else 'Slice'}]\n"
+            f"AllowedCPUs={hk}\n"
+            f"AllowedMemoryNodes={mem}\n"
+        )
+
+    out["irqnet.slice"] = (
+        SLICE_HEADER +
+        "[Unit]\n"
+        "Description=IRQ handling, softirq and NIC housekeeping\n"
+        "Before=slices.target\n\n"
+        "[Slice]\n"
+        f"AllowedCPUs={irq}\n"
+        f"AllowedMemoryNodes={mem}\n"
+        "CPUAccounting=yes\n"
+    )
+
+    out["pulsar.slice"] = (
+        SLICE_HEADER +
+        "[Unit]\n"
+        "Description=Pulsar application root slice (exclusive + shared cores)\n"
+        "Before=slices.target\n\n"
+        "[Slice]\n"
+        f"AllowedCPUs={app_all}\n"
+        f"AllowedMemoryNodes={mem}\n"
+        "CPUAccounting=yes\n"
+        "MemoryAccounting=yes\n"
+    )
+
+    out["pulsar-exclusive.slice"] = (
+        SLICE_HEADER +
+        "[Unit]\n"
+        "Description=Pulsar exclusive_cores - isolated, no load balancing, no tick\n"
+        "Before=slices.target\n\n"
+        "[Slice]\n"
+        f"AllowedCPUs={excl}\n"
+        f"AllowedMemoryNodes={mem}\n"
+        "CPUAccounting=yes\n"
+        "MemoryAccounting=yes\n"
+        "# Isolated cores must never be reclaimed under pressure.\n"
+        "MemorySwapMax=0\n"
+    )
+
+    out["pulsar-shared.slice"] = (
+        SLICE_HEADER +
+        "[Unit]\n"
+        "Description=Pulsar shared_cores - non-isolated, load balanced (GC, JIT, admin, compaction)\n"
+        "Before=slices.target\n\n"
+        "[Slice]\n"
+        f"AllowedCPUs={shared}\n"
+        f"AllowedMemoryNodes={mem}\n"
+        "CPUAccounting=yes\n"
+        "MemoryAccounting=yes\n"
+    )
+    return out
+
+
+def render_cores_env(plan):
+    a = plan["app"]
+    lines = [
+        "# Managed by lltune. Sourced by the application and by scripts/*.sh",
+        f"LLTUNE_PROFILE={plan['profile']}",
+        f"LLTUNE_VENDOR={plan['topology']['vendor']}",
+        f"LLTUNE_NUMA_NODES={plan['topology']['numa_nodes']}",
+        f"LLTUNE_SMT={plan['policy'].get('smt', 'off')}",
+        "",
+        "# --- application core contract ---",
+        f"EXCLUSIVE_CORES={a['exclusive_cores']}",
+        f"SHARED_CORES={a['shared_cores']}",
+        f"EXCLUSIVE_CORE_COUNT={a['exclusive_core_count']}",
+        f"SHARED_CORE_COUNT={a['shared_core_count']}",
+        "",
+        "# --- platform reserved ---",
+        f"HOUSEKEEPING_CORES={plan['roles']['housekeeping']['cpus']}",
+        f"IRQNET_CORES={plan['roles']['irqnet']['cpus']}",
+        f"ISOLATED_CPUS={plan['isolated_cpus']}",
+        f"NON_ISOLATED_CPUS={plan['non_isolated_cpus']}",
+        "",
+        "# --- per NUMA node ---",
+    ]
+    for node, v in sorted(a["per_node"].items(), key=lambda kv: int(kv[0])):
+        lines.append(f"EXCLUSIVE_CORES_NODE{node}={v['exclusive_cores']}")
+        lines.append(f"SHARED_CORES_NODE{node}={v['shared_cores']}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------- commands
+
+def load_policy(path=None):
+    p = Path(path) if path else REPO / "profiles" / "policy.json"
+    return json.loads(p.read_text())
+
+
+def load_profile(name):
+    p = Path(name)
+    if not p.exists():
+        p = REPO / "profiles" / f"{name}.json"
+    if not p.exists():
+        avail = ", ".join(sorted(f.stem for f in (REPO / "profiles").glob("*.json") if f.stem != "policy"))
+        raise SystemExit(f"unknown profile '{name}'. Available: {avail}")
+    return json.loads(p.read_text())
+
+
+def get_topology(args):
+    if args.live:
+        return topology_live(), "live"
+    if not args.profile:
+        raise SystemExit("pass --live to read this host, or --profile <name> to plan a shape")
+    prof = load_profile(args.profile)
+    return topology_from_profile(prof), prof["name"]
+
+
+def cmd_topology(args):
+    topo, _ = get_topology(args)
+    print(json.dumps(topo if args.verbose else
+                     {k: v for k, v in topo.items() if k != "cores"}, indent=2))
+
+
+def cmd_plan(args):
+    topo, name = get_topology(args)
+    policy = load_policy(args.policy)
+    for k, v in (("shared_ratio", args.shared_ratio),
+                 ("mitigations_off", args.mitigations_off),
+                 ("idle_poll", args.idle_poll),
+                 ("hugepages_1g_per_node", args.hugepages_1g_per_node)):
+        if v is not None:
+            policy[k] = v
+    plan = build_plan(topo, policy, name)
+    text = json.dumps(plan, indent=2)
+    if args.out:
+        Path(args.out).write_text(text + "\n")
+        print(f"wrote {args.out}", file=sys.stderr)
+    else:
+        print(text)
+
+
+def plan_for(args):
+    """--plan file wins, then a live/profile computation, then the installed plan."""
+    if getattr(args, "plan", None):
+        return json.loads(Path(args.plan).read_text())
+    if getattr(args, "profile", None) or getattr(args, "live", False):
+        topo, name = get_topology(args)
+        return build_plan(topo, load_policy(getattr(args, "policy", None)), name)
+    return current_plan()
+
+
+def cmd_show(args):
+    plan = plan_for(args)
+    t = plan["topology"]
+    print(f"profile   : {plan['profile']}  ({t['vendor']}, {t['sockets']}s x "
+          f"{t['total_cores'] // t['sockets']}c, {t['numa_nodes']} NUMA node(s), "
+          f"SMT {plan['policy'].get('smt')})")
+    print(f"cores     : {t['total_cores']} physical / {t['total_cpus']} logical "
+          f"-> {plan['roles']['exclusive']['cpu_count'] + plan['roles']['shared']['cpu_count'] + plan['roles']['housekeeping']['cpu_count'] + plan['roles']['irqnet']['cpu_count']} usable after SMT policy")
+    print()
+    hdr = f"{'node':>4}  {'housekeeping':>26}  {'irqnet':>22}  {'shared':>26}  {'exclusive':>30}"
+    print(hdr)
+    print("-" * len(hdr))
+    for n in plan["nodes"]:
+        print(f"{n['node']:>4}  {n['housekeeping']['cpus']:>26}  {n['irqnet']['cpus']:>22}  "
+              f"{n['shared']['cpus']:>26}  {n['exclusive']['cpus']:>30}")
+    print()
+    for r in ("housekeeping", "irqnet", "shared", "exclusive"):
+        v = plan["roles"][r]
+        pct = 100.0 * v["cpu_count"] / max(1, sum(plan["roles"][x]["cpu_count"] for x in plan["roles"]))
+        print(f"  {r:<13} {v['cpu_count']:>4} cpu  ({pct:5.1f}%)  {v['cpus']}")
+    print()
+    print(f"  exclusive_cores (app) = {plan['app']['exclusive_cores']}")
+    print(f"  shared_cores    (app) = {plan['app']['shared_cores']}")
+    print()
+    print("cmdline:")
+    for a in plan["cmdline"].split():
+        print(f"  {a}")
+
+
+def cmd_render(args):
+    plan = plan_for(args)
+    out = Path(args.out)
+    (out / "grub").mkdir(parents=True, exist_ok=True)
+    (out / "systemd").mkdir(parents=True, exist_ok=True)
+
+    (out / "grub" / "99-lowlatency.cfg").write_text(render_grub(plan))
+    for rel, body in render_slices(plan).items():
+        dest = out / "systemd" / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(body)
+    (out / "cores.env").write_text(render_cores_env(plan))
+    (out / "lowlatency-pulsar-variables.conf").write_text(
+        "# Managed by lltune. Install to /etc/tuned/lowlatency-pulsar-variables.conf\n"
+        f"isolated_cores={plan['isolated_cpus']}\n"
+        f"housekeeping_cores={plan['irq_landing_cpus']}\n"
+        f"shared_cores={plan['roles']['shared']['cpus']}\n")
+    (out / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    print(f"rendered into {out}")
+
+
+def current_plan(args=None):
+    if PLAN_PATH.exists():
+        return json.loads(PLAN_PATH.read_text())
+    raise SystemExit(f"no plan at {PLAN_PATH}; run 'lltune plan --live -o {PLAN_PATH}' first")
+
+
+# ---------------------------------------------------------------- validate
+
+class Checks:
+    def __init__(self):
+        self.rows = []
+
+    def add(self, ok, name, detail=""):
+        self.rows.append((ok, name, detail))
+
+    def report(self, quiet=False):
+        sym = {True: "PASS", False: "FAIL", None: "WARN"}
+        width = max(len(n) for _, n, _ in self.rows)
+        for ok, name, detail in self.rows:
+            if quiet and ok is True:
+                continue
+            print(f"[{sym[ok]}] {name:<{width}}  {detail}")
+        failed = sum(1 for ok, _, _ in self.rows if ok is False)
+        warned = sum(1 for ok, _, _ in self.rows if ok is None)
+        print(f"\n{len(self.rows)} checks, {failed} failed, {warned} warnings")
+        return 1 if failed else 0
+
+
+def cmd_validate(args):
+    plan = json.loads(Path(args.plan).read_text()) if args.plan else current_plan()
+    c = Checks()
+    cmdline = _read("/proc/cmdline", "")
+    iso_want = set(expand(plan["isolated_cpus"]))
+    hk_want = set(expand(plan["irq_landing_cpus"]))
+
+    # --- boot layer -------------------------------------------------------
+    smt = _read("/sys/devices/system/cpu/smt/control", "notsupported")
+    c.add(smt in ("off", "forceoff", "notsupported", "notimplemented"),
+          "smt disabled", f"smt/control={smt}")
+
+    online = set(expand(_read("/sys/devices/system/cpu/online", "")))
+    c.add(online == set(expand(plan["isolated_cpus"]) + expand(plan["non_isolated_cpus"])),
+          "online cpus match plan",
+          f"{len(online)} online, {len(iso_want) + len(expand(plan['non_isolated_cpus']))} planned")
+
+    iso_have = set(expand(_read("/sys/devices/system/cpu/isolated", "")))
+    c.add(iso_have == iso_want, "isolcpus active",
+          f"{compress(iso_have) or '<empty>'}" + ("" if iso_have == iso_want else f" != planned {plan['isolated_cpus']}"))
+
+    nohz = set(expand(_read("/sys/devices/system/cpu/nohz_full", "").replace("(null)", "")))
+    c.add(nohz == iso_want, "nohz_full active", compress(nohz) or "<empty>")
+
+    c.add("rcu_nocbs=" in cmdline, "rcu_nocbs on cmdline")
+    c.add("managed_irq" in cmdline, "isolcpus=managed_irq set",
+          "steers managed (ENA/NVMe) IRQs off isolated cores")
+
+    nb = _read("/proc/sys/kernel/numa_balancing", "0")
+    c.add(nb == "0", "numa_balancing off", f"kernel.numa_balancing={nb}")
+
+    # --- cgroup layer -----------------------------------------------------
+    cg = "/sys/fs/cgroup"
+    c.add(os.path.exists(f"{cg}/cgroup.controllers"), "cgroup v2 unified hierarchy")
+    subtree = _read(f"{cg}/cgroup.subtree_control", "")
+    c.add("cpuset" in subtree, "cpuset controller delegated", subtree)
+
+    for slice_name, want in (("system.slice", plan["roles"]["housekeeping"]["cpus"]),
+                             ("irqnet.slice", plan["roles"]["irqnet"]["cpus"]),
+                             ("pulsar-exclusive.slice", plan["roles"]["exclusive"]["cpus"]),
+                             ("pulsar-shared.slice", plan["roles"]["shared"]["cpus"])):
+        path = f"{cg}/{slice_name}/cpuset.cpus.effective"
+        if slice_name.startswith("pulsar-"):
+            path = f"{cg}/pulsar.slice/{slice_name}/cpuset.cpus.effective"
+        have = _read(path, "")
+        c.add(set(expand(have)) == set(expand(want)) if have else False,
+              f"{slice_name} cpuset", f"{have or '<missing>'} (want {want})")
+
+    # --- irq layer --------------------------------------------------------
+    leaked = []
+    for irq_dir in sorted(glob.glob("/proc/irq/[0-9]*")):
+        eff = _read(f"{irq_dir}/effective_affinity_list", "")
+        if not eff:
+            continue
+        bad = set(expand(eff)) & iso_want
+        if bad:
+            names = ",".join(os.path.basename(p) for p in glob.glob(f"{irq_dir}/*")
+                             if os.path.isdir(p)) or "?"
+            leaked.append(f"irq{os.path.basename(irq_dir)}({names}):{compress(bad)}")
+    c.add(not leaked, "no IRQ lands on an isolated cpu",
+          "; ".join(leaked[:6]) + (f" (+{len(leaked) - 6} more)" if len(leaked) > 6 else "") or "clean")
+
+    dflt = _read("/proc/irq/default_smp_affinity", "")
+    c.add(bool(dflt), "default_smp_affinity set", dflt)
+
+    # --- runtime layer ----------------------------------------------------
+    thp = _read("/sys/kernel/mm/transparent_hugepage/enabled", "")
+    c.add("[never]" in thp, "THP never", thp)
+
+    govs = {_read(g, "") for g in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")}
+    c.add(govs <= {"performance"} if govs else None, "cpufreq governor performance",
+          ",".join(sorted(govs)) or "no cpufreq driver (fixed frequency)")
+
+    wq = _read("/sys/devices/virtual/workqueue/cpumask", "")
+    wq_cpus = set(expand(compress(_mask_to_cpus(wq)))) if wq else set()
+    c.add(not (wq_cpus & iso_want) if wq else None, "unbound workqueues off isolated cpus",
+          f"cpumask={wq} -> {compress(wq_cpus)}")
+
+    wb = _read("/sys/bus/workqueue/devices/writeback/cpumask", "")
+    if wb:
+        wb_cpus = set(_mask_to_cpus(wb))
+        c.add(not (wb_cpus & iso_want), "writeback workqueue off isolated cpus", compress(wb_cpus))
+
+    ts = _read("/proc/sys/kernel/timer_migration", "1")
+    c.add(ts == "0", "timer_migration off", f"kernel.timer_migration={ts}")
+
+    wd = _read("/proc/sys/kernel/watchdog", "1")
+    c.add(wd == "0", "soft/hard lockup watchdog off", f"kernel.watchdog={wd}")
+
+    iface = primary_iface()
+    if iface:
+        try:
+            ch = subprocess.run(["ethtool", "-l", iface], capture_output=True, text=True, timeout=5).stdout
+            cur = re.search(r"Current hardware settings:.*?Combined:\s*(\d+)", ch, re.S)
+            n = int(cur.group(1)) if cur else -1
+            want = len(expand(plan["roles"]["irqnet"]["cpus"]))
+            c.add(n <= want if n > 0 else None, f"{iface} combined queues <= irqnet cores",
+                  f"combined={n}, irqnet cores={want}")
+        except Exception as e:
+            c.add(None, f"{iface} queue count", f"ethtool unavailable: {e}")
+
+    # --- stray tasks on isolated cores ------------------------------------
+    strays = _tasks_on(iso_want)
+    c.add(not strays, "no unexpected tasks on isolated cpus",
+          ", ".join(strays[:8]) + (f" (+{len(strays) - 8})" if len(strays) > 8 else "") or "clean")
+
+    return c.report(args.quiet)
+
+
+def _mask_to_cpus(mask):
+    mask = mask.replace(",", "")
+    try:
+        v = int(mask, 16)
+    except ValueError:
+        return []
+    return [i for i in range(v.bit_length()) if v >> i & 1]
+
+
+def _tasks_on(iso):
+    """Userspace tasks currently pinned onto isolated cpus that are not in a pulsar slice."""
+    out = []
+    for p in glob.glob("/proc/[0-9]*"):
+        try:
+            pid = os.path.basename(p)
+            stat = Path(p, "stat").read_text().rsplit(") ", 1)[1].split()
+            cpu = int(stat[36])  # last-run processor
+            if cpu not in iso:
+                continue
+            cg = Path(p, "cgroup").read_text()
+            if "pulsar" in cg:
+                continue
+            comm = Path(p, "comm").read_text().strip()
+            if comm.startswith(("swapper", "cpuhp/", "idle_inject", "migration/")):
+                continue
+            out.append(f"{comm}[{pid}]@cpu{cpu}")
+        except (OSError, IndexError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+# ---------------------------------------------------------------- cli
+
+def main():
+    ap = argparse.ArgumentParser(prog="lltune", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def src(p):
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--profile", help="planning profile name or path")
+        g.add_argument("--live", action="store_true", help="read the real topology from sysfs")
+
+    p = sub.add_parser("topology", help="show discovered or synthesised topology")
+    src(p); p.add_argument("-v", "--verbose", action="store_true"); p.set_defaults(fn=cmd_topology)
+
+    p = sub.add_parser("plan", help="compute the core plan")
+    src(p)
+    p.add_argument("--policy"); p.add_argument("-o", "--out")
+    p.add_argument("--shared-ratio", type=float, dest="shared_ratio")
+    p.add_argument("--hugepages-1g-per-node", type=int, dest="hugepages_1g_per_node")
+    p.add_argument("--mitigations-off", action="store_true", default=None, dest="mitigations_off")
+    p.add_argument("--idle-poll", action="store_true", default=None, dest="idle_poll")
+    p.set_defaults(fn=cmd_plan)
+
+    p = sub.add_parser("show", help="human-readable core map")
+    src(p); p.add_argument("--plan"); p.add_argument("--policy"); p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser("render", help="render grub / slices / cores.env from a plan")
+    src(p); p.add_argument("--plan"); p.add_argument("-o", "--out", default="./out")
+    p.set_defaults(fn=cmd_render)
+
+    p = sub.add_parser("validate", help="verify the running host matches the plan")
+    p.add_argument("--plan"); p.add_argument("-q", "--quiet", action="store_true",
+                                             help="only show failures and warnings")
+    p.set_defaults(fn=cmd_validate)
+
+    args = ap.parse_args()
+    if not hasattr(args, "live"):
+        args.live = False
+    sys.exit(args.fn(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

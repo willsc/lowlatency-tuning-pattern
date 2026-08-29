@@ -1,0 +1,35 @@
+{
+  "$comment": "Default core-allocation policy. Override per-site with --policy /path/to/policy.json",
+  "version": 1,
+
+  "smt": "off",
+  "_smt": "off => 'nosmt' on the cmdline and only primary threads are ever used. AMD 7a-family already ships SMT off; the flag is then a no-op.",
+
+  "housekeeping": { "ratio": 0.04, "min": 2, "max": 6 },
+  "_housekeeping": "Per-NUMA-node cores for system.slice: systemd, sshd, agents, CloudWatch, kernel per-cpu work. NEVER isolated. cpu0 is always forced into this set.",
+
+  "irqnet": { "ratio": 0.05, "min": 2, "max": 12 },
+  "_irqnet": "Per-NUMA-node cores for irqnet.slice: NIC/NVMe interrupt handling, irqbalance, softirq. NEVER isolated, otherwise managed_irq steering has nowhere to land.",
+
+  "shared_ratio": 0.15,
+  "_shared_ratio": "Fraction of each NUMA node's cores handed to the application as shared_cores (non-isolated, load-balanced). This is the pool for GC threads, JVM compiler threads, admin/HTTP endpoints, background compaction.",
+
+  "l3_align": true,
+  "_l3_align": "Round the non-isolated block up to a whole L3/CCX domain so exclusive cores never share last-level cache with housekeeping or IRQ work. Matters enormously on AMD (8-core CCX), less on Intel monolithic-L3.",
+
+  "min_exclusive_ratio": 0.55,
+  "_min_exclusive_ratio": "Sanity floor: refuse to emit a plan that leaves less than this fraction of cores exclusive.",
+
+  "hugepages_1g_per_node": 0,
+  "_hugepages_1g_per_node": "1GiB hugepages to reserve per NUMA node at boot. 0 disables. Sized for the JVM heap + direct buffers on that node.",
+
+  "mitigations_off": false,
+  "_mitigations_off": "Adds mitigations=off. Real latency win (5-30us tail on syscall-heavy paths), real security tradeoff. Off by default: opt in deliberately.",
+
+  "idle_poll": false,
+  "_idle_poll": "Adds idle=poll. Removes C-state exit latency entirely at the cost of ~100% power draw and heat on every core. Prefer cstate_max=1 first.",
+
+  "cstate_max": 1,
+  "rcu_nocb_poll": false,
+  "_rcu_nocb_poll": "Spawns polling rcuo kthreads instead of waking them. Lower tail latency for the isolated cores, more housekeeping CPU burn."
+}

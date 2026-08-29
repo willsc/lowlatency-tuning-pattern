@@ -1,0 +1,13 @@
+{
+  "name": "intel-24xl",
+  "description": "Intel Sapphire Rapids metal, single socket. c7i/m7i/r7i .metal-24xl",
+  "vendor": "intel",
+  "vcpus": 96,
+  "sockets": 1,
+  "cores_per_socket": 48,
+  "threads_per_core": 2,
+  "numa_nodes": 1,
+  "cores_per_l3": 48,
+  "_cores_per_l3": "Monolithic per-socket L3 on SPR (SNC disabled on EC2 metal), so l3_align is effectively a no-op here.",
+  "nic_numa_node": 0
+}
