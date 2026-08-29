@@ -1,0 +1,24 @@
+# Example of how an application consumes the plan. Copy to
+# /etc/systemd/system/pulsar-broker.service and adapt.
+[Unit]
+Description=Pulsar broker (exclusive cores)
+After=lltune-runtime.service
+Requires=lltune-runtime.service
+
+[Service]
+Type=simple
+# The slice is what actually grants access to the isolated CPUs: moving a task into a
+# cpuset rewrites its affinity mask, which is the only way onto an isolcpus'd core.
+Slice=pulsar-exclusive.slice
+EnvironmentFile=/etc/lowlatency/cores.env
+Environment=PULSAR_MEM=-Xms32g -Xmx32g -XX:+UseLargePages -XX:+AlwaysPreTouch
+# The app reads EXCLUSIVE_CORES / SHARED_CORES and pins its own IO threads.
+ExecStart=/opt/pulsar/bin/pulsar broker
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+OOMScoreAdjust=-900
+CPUSchedulingPolicy=other
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

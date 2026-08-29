@@ -1,0 +1,13 @@
+{
+  "name": "intel-96xl",
+  "description": "Intel Sapphire Rapids metal, quad socket (u7i-class). 384 vCPU",
+  "vendor": "intel",
+  "vcpus": 384,
+  "sockets": 4,
+  "cores_per_socket": 48,
+  "threads_per_core": 2,
+  "numa_nodes": 4,
+  "cores_per_l3": 48,
+  "nic_numa_node": 0,
+  "_warning": "4-socket: cross-socket hop count is 2 for the far sockets. Keep the latency-critical Pulsar broker on the NIC-local socket and treat the far sockets as capacity, not as low-latency real estate."
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=lltune runtime low-latency tuning (IRQ, NIC, workqueues, power)
+Documentation=file:///opt/lowlatency-tuning-pattern/docs/DESIGN.md
+After=network-online.target systemd-sysctl.service
+Wants=network-online.target
+ConditionPathExists=/etc/lowlatency/cores.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/lowlatency-tuning-pattern/scripts/apply-runtime.sh
+ExecReload=/opt/lowlatency-tuning-pattern/scripts/apply-runtime.sh
+# The tuner itself is housekeeping work.
+Slice=system.slice
+
+[Install]
+WantedBy=multi-user.target
