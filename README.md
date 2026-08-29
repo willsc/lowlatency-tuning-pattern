@@ -10,13 +10,16 @@ Every core on the box is assigned exactly one job:
 |---|---|---|---|
 | **housekeeping** | `system.slice`, `user.slice`, `init.scope` | no | systemd, sshd, agents, per-CPU kernel work. Always includes cpu0. |
 | **irqnet** | `irqnet.slice` | no | NIC/NVMe interrupts, softirq, irqbalance |
-| **shared** | `pulsar.slice` | no | the app's `shared_cores`: GC, JIT, admin endpoints, compaction |
+| **shared** | `system.slice` | no | the app's `shared_cores`: GC, JIT, admin endpoints, compaction |
 | **exclusive** | `pulsar.slice` | **yes** | the app's `exclusive_cores`: the latency-critical path |
 
-There is **one** application slice. Its cpuset is `exclusive + shared`; which of the two a
-thread lands on is the application's decision, made from the core lists below. The shared
-cores are not isolated, so a second cgroup around them would enforce nothing — it would just
-be another cpuset to keep in sync with the plan.
+`pulsar.slice` holds **only the isolated cores**. A cpuset is worth having where it gates
+something the kernel guarantees, and that is true of `isolcpus`'d CPUs and nothing else. The
+shared cores are ordinary load-balanced CPUs, so they live in `system.slice` alongside
+housekeeping and need no cgroup of their own. `user.slice`, `machine.slice` and `init.scope`
+stay housekeeping-only, so logins and containers cannot drift onto the app's shared pool.
+
+Every core is owned by exactly one of the three cpusets — `scripts/selftest.py` asserts it.
 
 The contract the application sees is exactly two lists:
 

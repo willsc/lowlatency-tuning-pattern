@@ -350,12 +350,25 @@ def render_slices(plan):
     irq = plan["roles"]["irqnet"]["cpus"]
     shared = plan["roles"]["shared"]["cpus"]
     excl = plan["roles"]["exclusive"]["cpus"]
-    app_all = compress(expand(shared) + expand(excl))
     mem = plan["memory_nodes"]
     out = {}
 
-    # Everything systemd owns by default gets squeezed onto housekeeping.
-    for unit in ("system.slice", "user.slice", "machine.slice", "init.scope"):
+    # system.slice is where systemd puts ordinary services, so it carries the shared pool
+    # as well as housekeeping: shared cores are not isolated, nothing about them needs
+    # gating, and this is what makes them reachable without inventing a cgroup for them.
+    hk_shared = compress(expand(hk) + expand(shared))
+    out["system.slice.d/10-lowlatency.conf"] = (
+        SLICE_HEADER +
+        "[Slice]\n"
+        f"# housekeeping = {hk}\n"
+        f"# shared_cores = {shared}\n"
+        f"AllowedCPUs={hk_shared}\n"
+        f"AllowedMemoryNodes={mem}\n"
+    )
+
+    # PID 1, login sessions and containers stay on housekeeping only - none of them should
+    # drift onto the application's shared pool.
+    for unit in ("user.slice", "machine.slice", "init.scope"):
         out[f"{unit}.d/10-lowlatency.conf"] = (
             SLICE_HEADER +
             f"[{'Scope' if unit.endswith('.scope') else 'Slice'}]\n"
@@ -374,20 +387,19 @@ def render_slices(plan):
         "CPUAccounting=yes\n"
     )
 
-    # One slice for the application. Its cpuset is exclusive + shared, and the split
-    # between them is the app's job: it reads EXCLUSIVE_CORES / SHARED_CORES from
-    # cores.env and pins its own threads. The shared cores are not isolated, so there is
-    # nothing for a second cgroup to enforce - a child slice there would only add a
-    # cpuset that has to be kept in sync with the plan for no guarantee in return.
+    # The application slice holds the isolated cores and nothing else. The cpuset exists
+    # to gate access to isolcpus'd CPUs, which is a real guarantee; the shared cores are
+    # ordinary load-balanced CPUs with no guarantee for a cpuset to enforce, so they are
+    # not in here. See docs/DESIGN.md for where shared_cores live instead.
     out["pulsar.slice"] = (
         SLICE_HEADER +
         "[Unit]\n"
-        "Description=Pulsar application slice (exclusive_cores + shared_cores)\n"
+        "Description=Pulsar exclusive_cores - isolated, no load balancing, no tick\n"
         "Before=slices.target\n\n"
         "[Slice]\n"
-        f"# exclusive_cores={excl}\n"
-        f"# shared_cores={shared}\n"
-        f"AllowedCPUs={app_all}\n"
+        f"# exclusive_cores (isolated) = {excl}\n"
+        f"# shared_cores (NOT in this slice) = {shared}\n"
+        f"AllowedCPUs={excl}\n"
         f"AllowedMemoryNodes={mem}\n"
         "CPUAccounting=yes\n"
         "MemoryAccounting=yes\n"
@@ -601,11 +613,11 @@ def cmd_validate(args):
     subtree = _read(f"{cg}/cgroup.subtree_control", "")
     c.add("cpuset" in subtree, "cpuset controller delegated", subtree)
 
-    app_cpus = compress(expand(plan["roles"]["exclusive"]["cpus"])
-                        + expand(plan["roles"]["shared"]["cpus"]))
-    for slice_name, want in (("system.slice", plan["roles"]["housekeeping"]["cpus"]),
+    hk_shared = compress(expand(plan["roles"]["housekeeping"]["cpus"])
+                         + expand(plan["roles"]["shared"]["cpus"]))
+    for slice_name, want in (("system.slice", hk_shared),
                              ("irqnet.slice", plan["roles"]["irqnet"]["cpus"]),
-                             ("pulsar.slice", app_cpus)):
+                             ("pulsar.slice", plan["roles"]["exclusive"]["cpus"])):
         have = _read(f"{cg}/{slice_name}/cpuset.cpus.effective", "")
         c.add(set(expand(have)) == set(expand(want)) if have else False,
               f"{slice_name} cpuset", f"{have or '<missing>'} (want {want})")

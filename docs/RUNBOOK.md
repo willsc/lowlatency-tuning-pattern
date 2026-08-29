@@ -133,13 +133,24 @@ source /etc/lowlatency/cores.env
 Units must declare a slice — that is what grants access to the isolated CPUs:
 
 ```ini
+# latency path -> isolated cores
 [Service]
 Slice=pulsar.slice
 EnvironmentFile=/etc/lowlatency/cores.env
 ```
 
-See `systemd/pulsar-broker.service.example`. The slice grants the union of both pools; the
-application decides which thread goes where. For a JVM app, put the latency-critical IO
+Units that should run on the shared pool need **no** `Slice=` at all — the default is
+`system.slice`, which carries housekeeping + shared:
+
+```ini
+# background / admin work -> shared cores, no Slice= needed
+[Service]
+EnvironmentFile=/etc/lowlatency/cores.env
+ExecStart=/opt/pulsar/bin/pulsar-admin ...
+```
+
+See `systemd/pulsar-broker.service.example`. `pulsar.slice` grants the isolated cores only;
+the shared pool comes from `system.slice`. For a JVM app, put the latency-critical IO
 threads on `EXCLUSIVE_CORES` and let GC/JIT threads float on `SHARED_CORES` — pinning GC
 threads to isolated cores defeats the isolation, since a GC pause on an exclusive core is
 exactly the jitter you removed the tick to avoid.

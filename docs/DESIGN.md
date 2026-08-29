@@ -87,35 +87,51 @@ The hierarchy:
 
 ```
 -.slice
-├── system.slice        AllowedCPUs = housekeeping
+├── system.slice        AllowedCPUs = housekeeping + shared
 ├── user.slice          AllowedCPUs = housekeeping
+├── machine.slice       AllowedCPUs = housekeeping
 ├── init.scope          AllowedCPUs = housekeeping
 ├── irqnet.slice        AllowedCPUs = irqnet
-└── pulsar.slice        AllowedCPUs = exclusive + shared
+└── pulsar.slice        AllowedCPUs = exclusive          (isolated only)
 ```
 
-### Why one application slice and not two
+### The cpuset boundary follows the isolation boundary
 
-An earlier revision split the application into `pulsar-exclusive.slice` and
-`pulsar-shared.slice`. That was structure for its own sake. A cpuset is a *restriction*, and
-a restriction is only worth having where it enforces a guarantee the kernel is not already
-making. On the exclusive cores the guarantee is real and comes from `isolcpus`: nothing runs
-there unless something explicitly grants access. On the shared cores there is no guarantee to
-enforce — they are ordinary load-balanced CPUs, and a cgroup around them would confine the
-application to a subset of cores it is already entitled to, at the cost of a second cpuset
-that has to be regenerated and kept in step with every plan change.
+A cpuset is a *restriction*, and a restriction earns its place only where it gates a
+guarantee the kernel is actually making. `isolcpus` makes exactly one such guarantee: those
+CPUs are out of every scheduler domain and out of init's inherited affinity mask, so nothing
+reaches them without an explicit grant. `pulsar.slice` is that grant, and it therefore
+contains the isolated cores and nothing else.
 
-So there is one `pulsar.slice` with `AllowedCPUs = exclusive + shared`. The split between the
-two pools is enforced where it actually belongs — in the application, which reads
-`EXCLUSIVE_CORES` and `SHARED_CORES` from `cores.env` and pins its own threads. That is a
-decision only the app can make correctly anyway: no cgroup can tell a broker's IO thread from
-its GC thread.
+The shared cores have no such guarantee to gate. They are ordinary load-balanced CPUs that
+happen to be reserved by convention for the application's non-latency work. Wrapping them in
+their own cgroup would confine the app to cores it is already entitled to, in exchange for
+another cpuset that has to be regenerated and kept in step with every plan change — cost
+without a guarantee. So they sit in `system.slice`, which is where systemd puts ordinary
+services anyway, and are reachable with no further ceremony.
 
-The `pulsar.slice` unit carries both lists as comments, so the file is still self-describing
-when someone reads it in `/etc/systemd/system` with no plan to hand.
+Two consequences worth being explicit about:
+
+- **Housekeeping and app shared work share one cpuset.** They are separated by convention
+  (`cores.env`) rather than by the kernel. If a runaway agent on a housekeeping core starts
+  competing with GC threads, no cgroup will stop it. Add `CPUWeight=` on the individual
+  units if that becomes a real contention problem — that is the right tool, not a cpuset.
+- **`user.slice`, `machine.slice` and `init.scope` stay housekeeping-only.** An SSH session
+  or a container has no business on the shared pool, and confining them keeps the shared
+  cores predictable for the application.
+
+The split between `exclusive_cores` and `shared_cores` is enforced where it belongs — in the
+application, which reads both lists from `cores.env` and pins its own threads. No cgroup can
+tell a broker's IO thread from its GC thread. The `pulsar.slice` and `system.slice` units
+each carry the relevant lists as comments, so both files stay self-describing when read in
+`/etc/systemd/system` with no plan to hand.
 
 **Escape hatch:** `user.slice` is confined to housekeeping, so an SSH session cannot profile
 an isolated core directly. Use `systemd-run --slice=pulsar.slice -t perf ...`.
+
+**Where a service lands by default:** anything with no `Slice=` goes to `system.slice`, so it
+gets housekeeping + shared and can never touch an isolated core by accident. Reaching the
+latency path requires naming `Slice=pulsar.slice` — which is the fail-safe direction.
 
 ### What is deliberately not used
 
