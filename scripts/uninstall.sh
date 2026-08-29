@@ -5,7 +5,7 @@ set -euo pipefail
 
 systemctl disable --now lltune-runtime.service lltune-validate.service 2>/dev/null || true
 rm -f /etc/systemd/system/lltune-{runtime,validate}.service
-rm -f /etc/systemd/system/{irqnet,pulsar,pulsar-exclusive,pulsar-shared}.slice
+rm -f /etc/systemd/system/{irqnet,pulsar}.slice
 rm -f /etc/systemd/system/{system.slice,user.slice,machine.slice,init.scope}.d/10-lowlatency.conf
 rm -f /etc/systemd/system/irqbalance.service.d/10-lowlatency.conf
 rm -f /etc/sysctl.d/99-lowlatency.conf

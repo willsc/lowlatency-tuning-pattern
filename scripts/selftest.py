@@ -98,13 +98,22 @@ for name in PROFILES:
         sl = lltune.render_slices(plan)
         def allowed(body):
             return set(expand(re.search(r"AllowedCPUs=(\S+)", body).group(1)))
-        check(allowed(sl["pulsar.slice"]) == roles["shared"] | roles["exclusive"],
-              f"{tag}: pulsar.slice is not the union of its children")
-        check(allowed(sl["pulsar-exclusive.slice"]) == roles["exclusive"], f"{tag}: exclusive slice")
-        check(allowed(sl["pulsar-shared.slice"]) == roles["shared"], f"{tag}: shared slice")
+        check(allowed(sl["pulsar.slice"]) == roles["exclusive"],
+              f"{tag}: pulsar.slice must be exactly the isolated cores")
+        check(not (allowed(sl["pulsar.slice"]) & roles["shared"]),
+              f"{tag}: pulsar.slice must not contain non-isolated shared cores")
+        check("pulsar-exclusive.slice" not in sl and "pulsar-shared.slice" not in sl,
+              f"{tag}: child pulsar slices should no longer be rendered")
         check(allowed(sl["irqnet.slice"]) == roles["irqnet"], f"{tag}: irqnet slice")
-        check(allowed(sl["system.slice.d/10-lowlatency.conf"]) == roles["housekeeping"],
-              f"{tag}: system.slice drop-in")
+        check(allowed(sl["system.slice.d/10-lowlatency.conf"])
+              == roles["housekeeping"] | roles["shared"],
+              f"{tag}: system.slice must be housekeeping + shared")
+        check(allowed(sl["user.slice.d/10-lowlatency.conf"]) == roles["housekeeping"],
+              f"{tag}: user.slice must stay housekeeping-only")
+        # Every core must be owned by exactly one of the three cpusets.
+        covered = (allowed(sl["system.slice.d/10-lowlatency.conf"])
+                   | allowed(sl["irqnet.slice"]) | allowed(sl["pulsar.slice"]))
+        check(covered == allcpus, f"{tag}: slices leave {len(allcpus - covered)} cores unowned")
 
         # cores.env round-trips
         env = dict(re.findall(r"^(\w+)=(.*)$", lltune.render_cores_env(plan), re.M))

@@ -6,7 +6,7 @@ Layers, in the order they must be applied:
 
   1. plan      : decide which physical core does what (pure computation, no side effects)
   2. boot      : GRUB cmdline  - isolcpus / nohz_full / rcu_nocbs / nosmt / numa_balancing  (needs reboot)
-  3. cgroup    : systemd slices - system.slice, irqnet.slice, pulsar.slice{,-exclusive,-shared}
+  3. cgroup    : systemd slices - system.slice, irqnet.slice, pulsar.slice
   4. runtime   : IRQ affinity, ENA queues, workqueues, governor, THP  (every boot)
   5. validate  : prove all four actually took effect
 
@@ -350,12 +350,25 @@ def render_slices(plan):
     irq = plan["roles"]["irqnet"]["cpus"]
     shared = plan["roles"]["shared"]["cpus"]
     excl = plan["roles"]["exclusive"]["cpus"]
-    app_all = compress(expand(shared) + expand(excl))
     mem = plan["memory_nodes"]
     out = {}
 
-    # Everything systemd owns by default gets squeezed onto housekeeping.
-    for unit in ("system.slice", "user.slice", "machine.slice", "init.scope"):
+    # system.slice is where systemd puts ordinary services, so it carries the shared pool
+    # as well as housekeeping: shared cores are not isolated, nothing about them needs
+    # gating, and this is what makes them reachable without inventing a cgroup for them.
+    hk_shared = compress(expand(hk) + expand(shared))
+    out["system.slice.d/10-lowlatency.conf"] = (
+        SLICE_HEADER +
+        "[Slice]\n"
+        f"# housekeeping = {hk}\n"
+        f"# shared_cores = {shared}\n"
+        f"AllowedCPUs={hk_shared}\n"
+        f"AllowedMemoryNodes={mem}\n"
+    )
+
+    # PID 1, login sessions and containers stay on housekeeping only - none of them should
+    # drift onto the application's shared pool.
+    for unit in ("user.slice", "machine.slice", "init.scope"):
         out[f"{unit}.d/10-lowlatency.conf"] = (
             SLICE_HEADER +
             f"[{'Scope' if unit.endswith('.scope') else 'Slice'}]\n"
@@ -374,42 +387,24 @@ def render_slices(plan):
         "CPUAccounting=yes\n"
     )
 
+    # The application slice holds the isolated cores and nothing else. The cpuset exists
+    # to gate access to isolcpus'd CPUs, which is a real guarantee; the shared cores are
+    # ordinary load-balanced CPUs with no guarantee for a cpuset to enforce, so they are
+    # not in here. See docs/DESIGN.md for where shared_cores live instead.
     out["pulsar.slice"] = (
-        SLICE_HEADER +
-        "[Unit]\n"
-        "Description=Pulsar application root slice (exclusive + shared cores)\n"
-        "Before=slices.target\n\n"
-        "[Slice]\n"
-        f"AllowedCPUs={app_all}\n"
-        f"AllowedMemoryNodes={mem}\n"
-        "CPUAccounting=yes\n"
-        "MemoryAccounting=yes\n"
-    )
-
-    out["pulsar-exclusive.slice"] = (
         SLICE_HEADER +
         "[Unit]\n"
         "Description=Pulsar exclusive_cores - isolated, no load balancing, no tick\n"
         "Before=slices.target\n\n"
         "[Slice]\n"
+        f"# exclusive_cores (isolated) = {excl}\n"
+        f"# shared_cores (NOT in this slice) = {shared}\n"
         f"AllowedCPUs={excl}\n"
         f"AllowedMemoryNodes={mem}\n"
         "CPUAccounting=yes\n"
         "MemoryAccounting=yes\n"
-        "# Isolated cores must never be reclaimed under pressure.\n"
+        "# The latency path must never be reclaimed under pressure.\n"
         "MemorySwapMax=0\n"
-    )
-
-    out["pulsar-shared.slice"] = (
-        SLICE_HEADER +
-        "[Unit]\n"
-        "Description=Pulsar shared_cores - non-isolated, load balanced (GC, JIT, admin, compaction)\n"
-        "Before=slices.target\n\n"
-        "[Slice]\n"
-        f"AllowedCPUs={shared}\n"
-        f"AllowedMemoryNodes={mem}\n"
-        "CPUAccounting=yes\n"
-        "MemoryAccounting=yes\n"
     )
     return out
 
@@ -618,14 +613,12 @@ def cmd_validate(args):
     subtree = _read(f"{cg}/cgroup.subtree_control", "")
     c.add("cpuset" in subtree, "cpuset controller delegated", subtree)
 
-    for slice_name, want in (("system.slice", plan["roles"]["housekeeping"]["cpus"]),
+    hk_shared = compress(expand(plan["roles"]["housekeeping"]["cpus"])
+                         + expand(plan["roles"]["shared"]["cpus"]))
+    for slice_name, want in (("system.slice", hk_shared),
                              ("irqnet.slice", plan["roles"]["irqnet"]["cpus"]),
-                             ("pulsar-exclusive.slice", plan["roles"]["exclusive"]["cpus"]),
-                             ("pulsar-shared.slice", plan["roles"]["shared"]["cpus"])):
-        path = f"{cg}/{slice_name}/cpuset.cpus.effective"
-        if slice_name.startswith("pulsar-"):
-            path = f"{cg}/pulsar.slice/{slice_name}/cpuset.cpus.effective"
-        have = _read(path, "")
+                             ("pulsar.slice", plan["roles"]["exclusive"]["cpus"])):
+        have = _read(f"{cg}/{slice_name}/cpuset.cpus.effective", "")
         c.add(set(expand(have)) == set(expand(want)) if have else False,
               f"{slice_name} cpuset", f"{have or '<missing>'} (want {want})")
 

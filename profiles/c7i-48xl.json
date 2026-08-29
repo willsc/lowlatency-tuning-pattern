@@ -1,7 +1,8 @@
 {
-  "name": "intel-48xl",
-  "description": "Intel Sapphire Rapids metal, dual socket. c7i/m7i/r7i .metal-48xl",
+  "name": "c7i-48xl",
+  "description": "c7i.metal-48xl - Intel Sapphire Rapids, dual socket",
   "vendor": "intel",
+  "metal_sku": "c7i.metal-48xl",
   "vcpus": 192,
   "sockets": 2,
   "cores_per_socket": 48,

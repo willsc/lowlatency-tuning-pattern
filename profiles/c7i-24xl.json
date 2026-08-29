@@ -1,0 +1,14 @@
+{
+  "name": "c7i-24xl",
+  "description": "c7i.metal-24xl - Intel Sapphire Rapids, single socket",
+  "vendor": "intel",
+  "metal_sku": "c7i.metal-24xl",
+  "vcpus": 96,
+  "sockets": 1,
+  "cores_per_socket": 48,
+  "threads_per_core": 2,
+  "numa_nodes": 1,
+  "cores_per_l3": 48,
+  "_cores_per_l3": "SPR presents one L3 per socket with SNC disabled, so l3_align is a no-op here.",
+  "nic_numa_node": 0
+}

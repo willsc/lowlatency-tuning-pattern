@@ -1,0 +1,14 @@
+{
+  "name": "c8i-48xl",
+  "description": "c8i.metal-48xl - Intel Xeon 6 (Granite Rapids), single socket",
+  "vendor": "intel",
+  "metal_sku": "c8i.metal-48xl",
+  "vcpus": 192,
+  "sockets": 1,
+  "cores_per_socket": 96,
+  "threads_per_core": 2,
+  "numa_nodes": 1,
+  "cores_per_l3": 96,
+  "_cores_per_l3": "Granite Rapids is multi-die but presents a unified per-socket L3 unless SNC is on. Confirm with --live: if SNC is enabled you will see 2-3 NUMA nodes per socket and this profile is wrong.",
+  "nic_numa_node": 0
+}

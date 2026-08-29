@@ -79,7 +79,7 @@ that mask. So by default *nothing* can run on an isolated core, which is what yo
 isolation is fail-safe rather than fail-open.
 
 Moving a task into a cpuset cgroup rewrites its allowed mask. That makes
-`Slice=pulsar-exclusive.slice` the grant mechanism: a unit gets access to the isolated cores
+`Slice=pulsar.slice` the grant mechanism: a unit gets access to the isolated cores
 because of where it lives in the hierarchy, not because someone remembered a `taskset`
 prefix in an `ExecStart`. Delete the slice and the access is gone.
 
@@ -87,21 +87,51 @@ The hierarchy:
 
 ```
 -.slice
-├── system.slice        AllowedCPUs = housekeeping
+├── system.slice        AllowedCPUs = housekeeping + shared
 ├── user.slice          AllowedCPUs = housekeeping
+├── machine.slice       AllowedCPUs = housekeeping
 ├── init.scope          AllowedCPUs = housekeeping
 ├── irqnet.slice        AllowedCPUs = irqnet
-└── pulsar.slice        AllowedCPUs = shared + exclusive
-    ├── pulsar-exclusive.slice   AllowedCPUs = exclusive
-    └── pulsar-shared.slice      AllowedCPUs = shared
+└── pulsar.slice        AllowedCPUs = exclusive          (isolated only)
 ```
 
-`pulsar.slice` must be the union of its children — a cgroup v2 cpuset cannot exceed its
-parent's, so a too-narrow parent silently truncates the children's `cpuset.cpus.effective`.
-`validate` checks the *effective* value for exactly this reason.
+### The cpuset boundary follows the isolation boundary
+
+A cpuset is a *restriction*, and a restriction earns its place only where it gates a
+guarantee the kernel is actually making. `isolcpus` makes exactly one such guarantee: those
+CPUs are out of every scheduler domain and out of init's inherited affinity mask, so nothing
+reaches them without an explicit grant. `pulsar.slice` is that grant, and it therefore
+contains the isolated cores and nothing else.
+
+The shared cores have no such guarantee to gate. They are ordinary load-balanced CPUs that
+happen to be reserved by convention for the application's non-latency work. Wrapping them in
+their own cgroup would confine the app to cores it is already entitled to, in exchange for
+another cpuset that has to be regenerated and kept in step with every plan change — cost
+without a guarantee. So they sit in `system.slice`, which is where systemd puts ordinary
+services anyway, and are reachable with no further ceremony.
+
+Two consequences worth being explicit about:
+
+- **Housekeeping and app shared work share one cpuset.** They are separated by convention
+  (`cores.env`) rather than by the kernel. If a runaway agent on a housekeeping core starts
+  competing with GC threads, no cgroup will stop it. Add `CPUWeight=` on the individual
+  units if that becomes a real contention problem — that is the right tool, not a cpuset.
+- **`user.slice`, `machine.slice` and `init.scope` stay housekeeping-only.** An SSH session
+  or a container has no business on the shared pool, and confining them keeps the shared
+  cores predictable for the application.
+
+The split between `exclusive_cores` and `shared_cores` is enforced where it belongs — in the
+application, which reads both lists from `cores.env` and pins its own threads. No cgroup can
+tell a broker's IO thread from its GC thread. The `pulsar.slice` and `system.slice` units
+each carry the relevant lists as comments, so both files stay self-describing when read in
+`/etc/systemd/system` with no plan to hand.
 
 **Escape hatch:** `user.slice` is confined to housekeeping, so an SSH session cannot profile
-an isolated core directly. Use `systemd-run --slice=pulsar-exclusive.slice -t perf ...`.
+an isolated core directly. Use `systemd-run --slice=pulsar.slice -t perf ...`.
+
+**Where a service lands by default:** anything with no `Slice=` goes to `system.slice`, so it
+gets housekeeping + shared and can never touch an isolated core by accident. Reaching the
+latency path requires naming `Slice=pulsar.slice` — which is the fail-safe direction.
 
 ### What is deliberately not used
 
@@ -137,7 +167,7 @@ never contends on a queue lock owned by another socket.
 ## 5. Sizing
 
 Defaults per NUMA node: housekeeping `max(2, 4%)` capped at 6, irqnet `max(2, 5%)` capped at
-12, shared 15%, rest exclusive. On `amd-48xl` that is 8 housekeeping / 10 irqnet / 30 shared
+12, shared 15%, rest exclusive. On `c7a-48xl` that is 8 housekeeping / 10 irqnet / 30 shared
 / 144 exclusive.
 
 The floors matter more than the ratios on small nodes, and the caps matter more on large
@@ -146,12 +176,14 @@ a dozen cores on a 384-vCPU box. `min_exclusive_ratio` is the backstop: if a pol
 would leave less than 55% of the machine exclusive, the planner refuses rather than emitting
 a plan nobody reviewed.
 
-### The 4-socket caveat
+### The dual-socket caveat
 
-On `intel-96xl` the NIC sits on one socket. Cores on the far sockets are two hops from it,
-and no amount of core isolation fixes an interconnect traversal. Treat the NIC-local socket
-as the low-latency real estate and the far sockets as capacity — pin the latency-critical
-brokers to `EXCLUSIVE_CORES_NODE<nic_numa_node>` and put bulk work everywhere else.
+On the `48xl` and `96xl` dual-socket shapes the NIC sits on one socket. Cores on the far
+socket are an interconnect hop away, and no amount of core isolation fixes a traversal.
+Treat the NIC-local socket as the low-latency real estate and the far socket as capacity —
+pin the latency-critical brokers to `EXCLUSIVE_CORES_NODE<nic_numa_node>` and put bulk work
+everywhere else. `c8a-96xl` is the sharpest case: 288 exclusive cores, but only half of them
+are one hop from the NIC.
 
 ## 6. What this cannot fix
 

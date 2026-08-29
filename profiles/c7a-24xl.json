@@ -1,0 +1,14 @@
+{
+  "name": "c7a-24xl",
+  "description": "c7a 24xl - AMD EPYC 9R14 (Genoa), single socket. SMT already disabled by AWS.",
+  "vendor": "amd",
+  "metal_sku": "c7a.24xlarge (VM size; c7a metal is 48xl only)",
+  "vcpus": 96,
+  "sockets": 1,
+  "cores_per_socket": 96,
+  "threads_per_core": 1,
+  "numa_nodes": 1,
+  "cores_per_l3": 8,
+  "_cores_per_l3": "Genoa CCX = 8 cores / 32MiB L3. l3_align keeps housekeeping and IRQ inside whole CCXs.",
+  "nic_numa_node": 0
+}

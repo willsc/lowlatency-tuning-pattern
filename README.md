@@ -1,8 +1,8 @@
 # lowlatency-tuning-pattern
 
-Deterministic core partitioning and low-latency tuning for **AWS bare-metal** instances
-(`.metal-24xl`, `.metal-48xl`, and 384-vCPU `96xl`-class), on both **Intel** Sapphire Rapids
-and **AMD** EPYC Genoa/Turin.
+Deterministic core partitioning and low-latency tuning for the **AWS compute-optimised
+bare-metal** families — **`c7i` / `c8i`** (Intel Sapphire Rapids / Xeon 6) and
+**`c7a` / `c8a`** (AMD EPYC Genoa / Turin) — at `24xl`, `48xl` and `96xl`.
 
 Every core on the box is assigned exactly one job:
 
@@ -10,8 +10,16 @@ Every core on the box is assigned exactly one job:
 |---|---|---|---|
 | **housekeeping** | `system.slice`, `user.slice`, `init.scope` | no | systemd, sshd, agents, per-CPU kernel work. Always includes cpu0. |
 | **irqnet** | `irqnet.slice` | no | NIC/NVMe interrupts, softirq, irqbalance |
-| **shared** | `pulsar-shared.slice` | no | the app's `shared_cores`: GC, JIT, admin endpoints, compaction |
-| **exclusive** | `pulsar-exclusive.slice` | **yes** | the app's `exclusive_cores`: the latency-critical path |
+| **shared** | `system.slice` | no | the app's `shared_cores`: GC, JIT, admin endpoints, compaction |
+| **exclusive** | `pulsar.slice` | **yes** | the app's `exclusive_cores`: the latency-critical path |
+
+`pulsar.slice` holds **only the isolated cores**. A cpuset is worth having where it gates
+something the kernel guarantees, and that is true of `isolcpus`'d CPUs and nothing else. The
+shared cores are ordinary load-balanced CPUs, so they live in `system.slice` alongside
+housekeeping and need no cgroup of their own. `user.slice`, `machine.slice` and `init.scope`
+stay housekeeping-only, so logins and containers cannot drift onto the app's shared pool.
+
+Every core is owned by exactly one of the three cpusets — `scripts/selftest.py` asserts it.
 
 The contract the application sees is exactly two lists:
 
@@ -32,8 +40,8 @@ A broker keeps serving traffic while its p99.9 quietly doubles.
 
 ```sh
 # See the plan for a shape you do not have in front of you
-./bin/lltune show --profile amd-48xl
-./bin/lltune show --profile intel-24xl
+./bin/lltune show --profile c7a-48xl
+./bin/lltune show --profile c8i-96xl
 
 # Plan from the real machine and install everything
 sudo ./scripts/install.sh --live
@@ -64,15 +72,24 @@ docs/RUNBOOK.md             apply, verify, roll back, debug a regression
 
 ## Supported shapes
 
-| Profile | Instance family | vCPU | Sockets × cores | SMT | NUMA | L3 domain |
+| Profile | CPU | vCPU | Sockets × cores | SMT | NUMA | L3 domain |
 |---|---|---|---|---|---|---|
-| `intel-24xl` | c7i/m7i/r7i `.metal-24xl` | 96 | 1 × 48 | 2 → off | 1 | per-socket |
-| `intel-48xl` | c7i/m7i/r7i `.metal-48xl` | 192 | 2 × 48 | 2 → off | 2 | per-socket |
-| `intel-96xl` | u7i-class, 4-socket | 384 | 4 × 48 | 2 → off | 4 | per-socket |
-| `amd-24xl` | m7a/c7a/r7a 24xl | 96 | 1 × 96 | already off | 1 | 8-core CCX |
-| `amd-48xl` | m7a/c7a/r7a `.metal-48xl` | 192 | 2 × 96 | already off | 2 | 8-core CCX |
-| `amd-96xl` | EPYC 9005-class, dual socket | 384 | 2 × 192 | already off | 2 | 8-core CCX |
-| `amd-milan-48xl` | c6a/m6a/r6a `.metal` | 192 | 2 × 48 | 2 → off | 2 | 8-core CCX |
+| `c7i-24xl` | Sapphire Rapids | 96 | 1 × 48 | 2 → off | 1 | per-socket |
+| `c7i-48xl` | Sapphire Rapids | 192 | 2 × 48 | 2 → off | 2 | per-socket |
+| `c8i-24xl` | Xeon 6 (Granite Rapids) | 96 | 1 × 48 | 2 → off | 1 | per-socket |
+| `c8i-48xl` | Xeon 6 (Granite Rapids) | 192 | 1 × 96 | 2 → off | 1 | per-socket |
+| `c8i-96xl` | Xeon 6 (Granite Rapids) | 384 | 2 × 96 | 2 → off | 2 | per-socket |
+| `c7a-24xl` | EPYC 9R14 (Genoa) | 96 | 1 × 96 | already off | 1 | 8-core CCX |
+| `c7a-48xl` | EPYC 9R14 (Genoa) | 192 | 2 × 96 | already off | 2 | 8-core CCX |
+| `c8a-24xl` | EPYC 9005 (Turin) | 96 | 1 × 96 | already off | 1 | 8-core CCX |
+| `c8a-48xl` | EPYC 9005 (Turin) | 192 | 1 × 192 | already off | 1 | 16-core CCX |
+| `c8a-96xl` | EPYC 9005 (Turin) | 384 | 2 × 192 | already off | 2 | 16-core CCX |
+
+The `c8i` and `c8a` socket/CCX layouts are best-known planning defaults, not measured — the
+generation is new enough that AWS may present it differently. Confirm on first contact with
+the hardware (`lltune topology --live`); if SNC is enabled on Xeon 6 you will see 2–3 NUMA
+nodes per socket and the profile needs updating. Nothing downstream depends on the profile
+being right when you install with `--live`.
 
 Profiles exist so you can plan and review a shape you are not currently logged into (and
 bake a plan into an AMI). **On the host, `--live` is authoritative** — it reads sysfs and
