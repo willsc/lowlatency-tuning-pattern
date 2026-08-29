@@ -99,9 +99,9 @@ for name in PROFILES:
         def allowed(body):
             return set(expand(re.search(r"AllowedCPUs=(\S+)", body).group(1)))
         check(allowed(sl["pulsar.slice"]) == roles["shared"] | roles["exclusive"],
-              f"{tag}: pulsar.slice is not the union of its children")
-        check(allowed(sl["pulsar-exclusive.slice"]) == roles["exclusive"], f"{tag}: exclusive slice")
-        check(allowed(sl["pulsar-shared.slice"]) == roles["shared"], f"{tag}: shared slice")
+              f"{tag}: pulsar.slice must cover exclusive + shared")
+        check("pulsar-exclusive.slice" not in sl and "pulsar-shared.slice" not in sl,
+              f"{tag}: child pulsar slices should no longer be rendered")
         check(allowed(sl["irqnet.slice"]) == roles["irqnet"], f"{tag}: irqnet slice")
         check(allowed(sl["system.slice.d/10-lowlatency.conf"]) == roles["housekeeping"],
               f"{tag}: system.slice drop-in")

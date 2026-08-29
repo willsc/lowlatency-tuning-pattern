@@ -1,0 +1,14 @@
+{
+  "name": "c8a-48xl",
+  "description": "c8a.metal-48xl - AMD EPYC 9005 (Turin), single socket. SMT disabled.",
+  "vendor": "amd",
+  "metal_sku": "c8a.metal-48xl",
+  "vcpus": 192,
+  "sockets": 1,
+  "cores_per_socket": 192,
+  "threads_per_core": 1,
+  "numa_nodes": 1,
+  "cores_per_l3": 16,
+  "_cores_per_l3": "Turin dense (Zen 5c) uses a 16-core CCX. If this host is classic Zen 5, it is 8 - check with --live, it changes where the exclusive block starts.",
+  "nic_numa_node": 0
+}

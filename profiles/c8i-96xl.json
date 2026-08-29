@@ -1,0 +1,13 @@
+{
+  "name": "c8i-96xl",
+  "description": "c8i.metal-96xl - Intel Xeon 6 (Granite Rapids), dual socket",
+  "vendor": "intel",
+  "metal_sku": "c8i.metal-96xl",
+  "vcpus": 384,
+  "sockets": 2,
+  "cores_per_socket": 96,
+  "threads_per_core": 2,
+  "numa_nodes": 2,
+  "cores_per_l3": 96,
+  "nic_numa_node": 0
+}

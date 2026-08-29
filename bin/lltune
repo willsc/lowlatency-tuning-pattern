@@ -6,7 +6,7 @@ Layers, in the order they must be applied:
 
   1. plan      : decide which physical core does what (pure computation, no side effects)
   2. boot      : GRUB cmdline  - isolcpus / nohz_full / rcu_nocbs / nosmt / numa_balancing  (needs reboot)
-  3. cgroup    : systemd slices - system.slice, irqnet.slice, pulsar.slice{,-exclusive,-shared}
+  3. cgroup    : systemd slices - system.slice, irqnet.slice, pulsar.slice
   4. runtime   : IRQ affinity, ENA queues, workqueues, governor, THP  (every boot)
   5. validate  : prove all four actually took effect
 
@@ -374,42 +374,25 @@ def render_slices(plan):
         "CPUAccounting=yes\n"
     )
 
+    # One slice for the application. Its cpuset is exclusive + shared, and the split
+    # between them is the app's job: it reads EXCLUSIVE_CORES / SHARED_CORES from
+    # cores.env and pins its own threads. The shared cores are not isolated, so there is
+    # nothing for a second cgroup to enforce - a child slice there would only add a
+    # cpuset that has to be kept in sync with the plan for no guarantee in return.
     out["pulsar.slice"] = (
         SLICE_HEADER +
         "[Unit]\n"
-        "Description=Pulsar application root slice (exclusive + shared cores)\n"
+        "Description=Pulsar application slice (exclusive_cores + shared_cores)\n"
         "Before=slices.target\n\n"
         "[Slice]\n"
+        f"# exclusive_cores={excl}\n"
+        f"# shared_cores={shared}\n"
         f"AllowedCPUs={app_all}\n"
         f"AllowedMemoryNodes={mem}\n"
         "CPUAccounting=yes\n"
         "MemoryAccounting=yes\n"
-    )
-
-    out["pulsar-exclusive.slice"] = (
-        SLICE_HEADER +
-        "[Unit]\n"
-        "Description=Pulsar exclusive_cores - isolated, no load balancing, no tick\n"
-        "Before=slices.target\n\n"
-        "[Slice]\n"
-        f"AllowedCPUs={excl}\n"
-        f"AllowedMemoryNodes={mem}\n"
-        "CPUAccounting=yes\n"
-        "MemoryAccounting=yes\n"
-        "# Isolated cores must never be reclaimed under pressure.\n"
+        "# The latency path must never be reclaimed under pressure.\n"
         "MemorySwapMax=0\n"
-    )
-
-    out["pulsar-shared.slice"] = (
-        SLICE_HEADER +
-        "[Unit]\n"
-        "Description=Pulsar shared_cores - non-isolated, load balanced (GC, JIT, admin, compaction)\n"
-        "Before=slices.target\n\n"
-        "[Slice]\n"
-        f"AllowedCPUs={shared}\n"
-        f"AllowedMemoryNodes={mem}\n"
-        "CPUAccounting=yes\n"
-        "MemoryAccounting=yes\n"
     )
     return out
 
@@ -618,14 +601,12 @@ def cmd_validate(args):
     subtree = _read(f"{cg}/cgroup.subtree_control", "")
     c.add("cpuset" in subtree, "cpuset controller delegated", subtree)
 
+    app_cpus = compress(expand(plan["roles"]["exclusive"]["cpus"])
+                        + expand(plan["roles"]["shared"]["cpus"]))
     for slice_name, want in (("system.slice", plan["roles"]["housekeeping"]["cpus"]),
                              ("irqnet.slice", plan["roles"]["irqnet"]["cpus"]),
-                             ("pulsar-exclusive.slice", plan["roles"]["exclusive"]["cpus"]),
-                             ("pulsar-shared.slice", plan["roles"]["shared"]["cpus"])):
-        path = f"{cg}/{slice_name}/cpuset.cpus.effective"
-        if slice_name.startswith("pulsar-"):
-            path = f"{cg}/pulsar.slice/{slice_name}/cpuset.cpus.effective"
-        have = _read(path, "")
+                             ("pulsar.slice", app_cpus)):
+        have = _read(f"{cg}/{slice_name}/cpuset.cpus.effective", "")
         c.add(set(expand(have)) == set(expand(want)) if have else False,
               f"{slice_name} cpuset", f"{have or '<missing>'} (want {want})")
 

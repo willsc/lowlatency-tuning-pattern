@@ -2,7 +2,7 @@
 # Install a rendered plan onto this host.
 #
 #   ./scripts/install.sh --live                 plan from the real topology (normal case)
-#   ./scripts/install.sh --profile amd-48xl     plan from a profile (bake into an AMI)
+#   ./scripts/install.sh --profile c7a-48xl     plan from a profile (bake into an AMI)
 #   ./scripts/install.sh --live --no-boot       cgroup + runtime only, no reboot needed
 #
 # The boot layer needs a reboot. Nothing else does.
@@ -56,13 +56,13 @@ for f in system.slice user.slice machine.slice init.scope; do
   install -d "/etc/systemd/system/$f.d"
   install -m 0644 "$STAGE/out/systemd/$f.d/10-lowlatency.conf" "/etc/systemd/system/$f.d/10-lowlatency.conf"
 done
-for f in irqnet.slice pulsar.slice pulsar-exclusive.slice pulsar-shared.slice; do
+for f in irqnet.slice pulsar.slice; do
   install -m 0644 "$STAGE/out/systemd/$f" "/etc/systemd/system/$f"
 done
 install -m 0644 "$REPO/systemd/lltune-runtime.service"  /etc/systemd/system/
 install -m 0644 "$REPO/systemd/lltune-validate.service" /etc/systemd/system/
 systemctl daemon-reload
-systemctl start irqnet.slice pulsar.slice pulsar-exclusive.slice pulsar-shared.slice
+systemctl start irqnet.slice pulsar.slice
 systemctl enable lltune-runtime.service lltune-validate.service >/dev/null
 
 if (( DO_BOOT )); then

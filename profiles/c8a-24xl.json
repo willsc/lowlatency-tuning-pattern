@@ -1,0 +1,13 @@
+{
+  "name": "c8a-24xl",
+  "description": "c8a 24xl - AMD EPYC 9005 (Turin), single socket. SMT disabled.",
+  "vendor": "amd",
+  "metal_sku": "c8a.24xlarge (VM size)",
+  "vcpus": 96,
+  "sockets": 1,
+  "cores_per_socket": 96,
+  "threads_per_core": 1,
+  "numa_nodes": 1,
+  "cores_per_l3": 8,
+  "nic_numa_node": 0
+}

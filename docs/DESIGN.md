@@ -79,7 +79,7 @@ that mask. So by default *nothing* can run on an isolated core, which is what yo
 isolation is fail-safe rather than fail-open.
 
 Moving a task into a cpuset cgroup rewrites its allowed mask. That makes
-`Slice=pulsar-exclusive.slice` the grant mechanism: a unit gets access to the isolated cores
+`Slice=pulsar.slice` the grant mechanism: a unit gets access to the isolated cores
 because of where it lives in the hierarchy, not because someone remembered a `taskset`
 prefix in an `ExecStart`. Delete the slice and the access is gone.
 
@@ -91,17 +91,31 @@ The hierarchy:
 ├── user.slice          AllowedCPUs = housekeeping
 ├── init.scope          AllowedCPUs = housekeeping
 ├── irqnet.slice        AllowedCPUs = irqnet
-└── pulsar.slice        AllowedCPUs = shared + exclusive
-    ├── pulsar-exclusive.slice   AllowedCPUs = exclusive
-    └── pulsar-shared.slice      AllowedCPUs = shared
+└── pulsar.slice        AllowedCPUs = exclusive + shared
 ```
 
-`pulsar.slice` must be the union of its children — a cgroup v2 cpuset cannot exceed its
-parent's, so a too-narrow parent silently truncates the children's `cpuset.cpus.effective`.
-`validate` checks the *effective* value for exactly this reason.
+### Why one application slice and not two
+
+An earlier revision split the application into `pulsar-exclusive.slice` and
+`pulsar-shared.slice`. That was structure for its own sake. A cpuset is a *restriction*, and
+a restriction is only worth having where it enforces a guarantee the kernel is not already
+making. On the exclusive cores the guarantee is real and comes from `isolcpus`: nothing runs
+there unless something explicitly grants access. On the shared cores there is no guarantee to
+enforce — they are ordinary load-balanced CPUs, and a cgroup around them would confine the
+application to a subset of cores it is already entitled to, at the cost of a second cpuset
+that has to be regenerated and kept in step with every plan change.
+
+So there is one `pulsar.slice` with `AllowedCPUs = exclusive + shared`. The split between the
+two pools is enforced where it actually belongs — in the application, which reads
+`EXCLUSIVE_CORES` and `SHARED_CORES` from `cores.env` and pins its own threads. That is a
+decision only the app can make correctly anyway: no cgroup can tell a broker's IO thread from
+its GC thread.
+
+The `pulsar.slice` unit carries both lists as comments, so the file is still self-describing
+when someone reads it in `/etc/systemd/system` with no plan to hand.
 
 **Escape hatch:** `user.slice` is confined to housekeeping, so an SSH session cannot profile
-an isolated core directly. Use `systemd-run --slice=pulsar-exclusive.slice -t perf ...`.
+an isolated core directly. Use `systemd-run --slice=pulsar.slice -t perf ...`.
 
 ### What is deliberately not used
 
@@ -137,7 +151,7 @@ never contends on a queue lock owned by another socket.
 ## 5. Sizing
 
 Defaults per NUMA node: housekeeping `max(2, 4%)` capped at 6, irqnet `max(2, 5%)` capped at
-12, shared 15%, rest exclusive. On `amd-48xl` that is 8 housekeeping / 10 irqnet / 30 shared
+12, shared 15%, rest exclusive. On `c7a-48xl` that is 8 housekeeping / 10 irqnet / 30 shared
 / 144 exclusive.
 
 The floors matter more than the ratios on small nodes, and the caps matter more on large
@@ -146,12 +160,14 @@ a dozen cores on a 384-vCPU box. `min_exclusive_ratio` is the backstop: if a pol
 would leave less than 55% of the machine exclusive, the planner refuses rather than emitting
 a plan nobody reviewed.
 
-### The 4-socket caveat
+### The dual-socket caveat
 
-On `intel-96xl` the NIC sits on one socket. Cores on the far sockets are two hops from it,
-and no amount of core isolation fixes an interconnect traversal. Treat the NIC-local socket
-as the low-latency real estate and the far sockets as capacity — pin the latency-critical
-brokers to `EXCLUSIVE_CORES_NODE<nic_numa_node>` and put bulk work everywhere else.
+On the `48xl` and `96xl` dual-socket shapes the NIC sits on one socket. Cores on the far
+socket are an interconnect hop away, and no amount of core isolation fixes a traversal.
+Treat the NIC-local socket as the low-latency real estate and the far socket as capacity —
+pin the latency-critical brokers to `EXCLUSIVE_CORES_NODE<nic_numa_node>` and put bulk work
+everywhere else. `c8a-96xl` is the sharpest case: 288 exclusive cores, but only half of them
+are one hop from the NIC.
 
 ## 6. What this cannot fix
 

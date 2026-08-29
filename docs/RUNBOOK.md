@@ -21,7 +21,7 @@ boot layer needs the reboot.
 
 ```sh
 sudo ./scripts/install.sh --live --no-boot                 # cgroups + runtime only, no reboot
-sudo ./scripts/install.sh --profile amd-48xl               # bake into an AMI, no live host needed
+sudo ./scripts/install.sh --profile c7a-48xl               # bake into an AMI, no live host needed
 sudo ./scripts/install.sh --live --shared-ratio 0.20       # bigger shared pool
 sudo ./scripts/install.sh --live --hugepages-1g-per-node 32
 sudo ./scripts/install.sh --live --mitigations-off         # read docs/DESIGN.md §2 first
@@ -134,19 +134,24 @@ Units must declare a slice — that is what grants access to the isolated CPUs:
 
 ```ini
 [Service]
-Slice=pulsar-exclusive.slice
+Slice=pulsar.slice
 EnvironmentFile=/etc/lowlatency/cores.env
 ```
 
-See `systemd/pulsar-broker.service.example`. For a JVM app, put the latency-critical IO
+See `systemd/pulsar-broker.service.example`. The slice grants the union of both pools; the
+application decides which thread goes where. For a JVM app, put the latency-critical IO
 threads on `EXCLUSIVE_CORES` and let GC/JIT threads float on `SHARED_CORES` — pinning GC
 threads to isolated cores defeats the isolation, since a GC pause on an exclusive core is
 exactly the jitter you removed the tick to avoid.
 
+Because nothing but the app enforces this split, it is worth asserting in the app's own
+startup: refuse to boot if a thread pool is configured onto a core outside the pool it
+belongs in. `lltune validate` cannot see inside the JVM.
+
 To run an ad-hoc command on the isolated set (SSH sessions are confined to housekeeping):
 
 ```sh
-sudo systemd-run --slice=pulsar-exclusive.slice -t /bin/bash
+sudo systemd-run --slice=pulsar.slice -t /bin/bash
 ```
 
 ## Adding a new instance shape

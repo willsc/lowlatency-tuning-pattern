@@ -1,7 +1,8 @@
 {
-  "name": "amd-48xl",
-  "description": "AMD EPYC 9R14 (Genoa) metal, dual socket. m7a/c7a/r7a .metal-48xl. SMT already disabled by AWS.",
+  "name": "c7a-48xl",
+  "description": "c7a.metal-48xl - AMD EPYC 9R14 (Genoa), dual socket. SMT already disabled by AWS.",
   "vendor": "amd",
+  "metal_sku": "c7a.metal-48xl",
   "vcpus": 192,
   "sockets": 2,
   "cores_per_socket": 96,
