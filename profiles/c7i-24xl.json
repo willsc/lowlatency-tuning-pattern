@@ -1,6 +1,6 @@
 {
   "name": "c7i-24xl",
-  "description": "c7i.metal-24xl - Intel Sapphire Rapids, single socket",
+  "description": "c7i.metal-24xl - custom Intel Sapphire Rapids, single socket",
   "vendor": "intel",
   "metal_sku": "c7i.metal-24xl",
   "vcpus": 96,
@@ -9,6 +9,11 @@
   "threads_per_core": 2,
   "numa_nodes": 1,
   "cores_per_l3": 48,
-  "_cores_per_l3": "SPR presents one L3 per socket with SNC disabled, so l3_align is a no-op here.",
-  "nic_numa_node": 0
+  "nic_numa_node": 0,
+  "numa_mode": "SNC disabled - 1 NUMA node per socket",
+  "confidence": {
+    "sku_and_vcpus": "verified - AWS c7i instance page",
+    "sockets_and_cores": "derived from vCPU count and SMT2",
+    "numa_nodes": "ASSUMED. SNC is not documented as enabled for SPR on EC2. Confirm with 'lltune topology --live'."
+  }
 }

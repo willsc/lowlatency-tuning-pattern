@@ -607,6 +607,30 @@ def cmd_validate(args):
     nb = _read("/proc/sys/kernel/numa_balancing", "0")
     c.add(nb == "0", "numa_balancing off", f"kernel.numa_balancing={nb}")
 
+    # A plan built from the wrong NUMA assumption is silently wrong: the core counts look
+    # plausible, but housekeeping and IRQ cores land in the wrong memory domains. Under
+    # SNC3 a Xeon 6 socket is 3 NUMA nodes, not 1 - getting that wrong is a 3x error in
+    # how many cores the platform reserves.
+    live_nodes = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
+    want_nodes = plan["topology"]["numa_nodes"]
+    c.add(live_nodes == want_nodes, "NUMA node count matches plan",
+          f"host has {live_nodes}, plan assumes {want_nodes}"
+          + ("" if live_nodes == want_nodes
+             else " - REPLAN with --live; the profile's numa_nodes is wrong"))
+
+    for nd in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
+        node = int(re.search(r"node(\d+)$", nd).group(1))
+        planned = next((n for n in plan["nodes"] if n["node"] == node), None)
+        if planned is None:
+            continue
+        live_cpus = set(expand(_read(f"{nd}/cpulist", "")))
+        planned_cpus = set()
+        for role in ("housekeeping", "irqnet", "shared", "exclusive"):
+            planned_cpus |= set(expand(planned[role]["cpus"]))
+        stray = planned_cpus - live_cpus
+        c.add(not stray, f"node{node} plan cpus are node-local",
+              f"{compress(stray)} planned on node{node} but live elsewhere" if stray else "clean")
+
     # --- cgroup layer -----------------------------------------------------
     cg = "/sys/fs/cgroup"
     c.add(os.path.exists(f"{cg}/cgroup.controllers"), "cgroup v2 unified hierarchy")

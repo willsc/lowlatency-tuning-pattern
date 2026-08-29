@@ -24,7 +24,7 @@ sudo ./scripts/install.sh --live --no-boot                 # cgroups + runtime o
 sudo ./scripts/install.sh --profile c7a-48xl               # bake into an AMI, no live host needed
 sudo ./scripts/install.sh --live --shared-ratio 0.20       # bigger shared pool
 sudo ./scripts/install.sh --live --hugepages-1g-per-node 32
-sudo ./scripts/install.sh --live --mitigations-off         # read docs/DESIGN.md §2 first
+sudo ./scripts/install.sh --live --mitigations-off         # read docs/DESIGN.md §3 first
 ```
 
 ## Change the core split on a running fleet
@@ -164,6 +164,31 @@ To run an ad-hoc command on the isolated set (SSH sessions are confined to house
 ```sh
 sudo systemd-run --slice=pulsar.slice -t /bin/bash
 ```
+
+## Confirming NUMA topology on first contact
+
+The profiles record which fields are verified and which are inferred (`confidence` block in
+each `profiles/*.json`). Granite Rapids runs **SNC3**, so a `c8i.metal-96xl` is six NUMA
+nodes, not two — see `docs/DESIGN.md` §2. The AMD NPS setting and Turin's CCX size are
+inferred and should be confirmed the first time you touch one of those shapes:
+
+```sh
+lscpu | grep -E 'Socket|NUMA|Thread|Model name'
+numactl --hardware
+lscpu -e=CPU,NODE,SOCKET,CORE,L3        # the L3 column shows CCX / compute-die boundaries
+```
+
+Then check the profile agrees with reality:
+
+```sh
+diff <(./bin/lltune topology --profile c8i-96xl) <(./bin/lltune topology --live)
+```
+
+`lltune validate` also fails outright if the running host's NUMA node count disagrees with
+the installed plan, and checks that every CPU the plan assigned to a node is resident there.
+A plan built on the wrong node count looks perfectly plausible — the ranges are contiguous
+and the counts add up — so this check is the thing standing between you and a silently wrong
+partition.
 
 ## Adding a new instance shape
 

@@ -72,24 +72,31 @@ docs/RUNBOOK.md             apply, verify, roll back, debug a regression
 
 ## Supported shapes
 
-| Profile | CPU | vCPU | Sockets × cores | SMT | NUMA | L3 domain |
-|---|---|---|---|---|---|---|
-| `c7i-24xl` | Sapphire Rapids | 96 | 1 × 48 | 2 → off | 1 | per-socket |
-| `c7i-48xl` | Sapphire Rapids | 192 | 2 × 48 | 2 → off | 2 | per-socket |
-| `c8i-24xl` | Xeon 6 (Granite Rapids) | 96 | 1 × 48 | 2 → off | 1 | per-socket |
-| `c8i-48xl` | Xeon 6 (Granite Rapids) | 192 | 1 × 96 | 2 → off | 1 | per-socket |
-| `c8i-96xl` | Xeon 6 (Granite Rapids) | 384 | 2 × 96 | 2 → off | 2 | per-socket |
-| `c7a-24xl` | EPYC 9R14 (Genoa) | 96 | 1 × 96 | already off | 1 | 8-core CCX |
-| `c7a-48xl` | EPYC 9R14 (Genoa) | 192 | 2 × 96 | already off | 2 | 8-core CCX |
-| `c8a-24xl` | EPYC 9005 (Turin) | 96 | 1 × 96 | already off | 1 | 8-core CCX |
-| `c8a-48xl` | EPYC 9005 (Turin) | 192 | 1 × 192 | already off | 1 | 16-core CCX |
-| `c8a-96xl` | EPYC 9005 (Turin) | 384 | 2 × 192 | already off | 2 | 16-core CCX |
+| Profile | Metal SKU | CPU | Sockets × cores | SMT | NUMA mode | **NUMA nodes** | L3 domain |
+|---|---|---|---|---|---|---|---|
+| `c7i-24xl` | `c7i.metal-24xl` | Sapphire Rapids | 1 × 48 | 2 → off | SNC off | 1 | per socket |
+| `c7i-48xl` | `c7i.metal-48xl` | Sapphire Rapids | 2 × 48 | 2 → off | SNC off | 2 | per socket |
+| `c8i-48xl` | `c8i.metal-48xl` | Xeon 6 (Granite Rapids) | 1 × 96 | 2 → off | **SNC3** | **3** | 32 cores/die |
+| `c8i-96xl` | `c8i.metal-96xl` | Xeon 6975P-C | 2 × 96 | 2 → off | **SNC3** | **6** | 32 cores/die |
+| `c7a-48xl` | `c7a.metal-48xl` | EPYC 9R14 (Genoa) | 2 × 96 | already off | NPS1 | 2 | 8-core CCX |
+| `c8a-24xl` | `c8a.metal-24xl` | EPYC Turin | 1 × 96 | already off | NPS1 | 1 | 8-core CCX |
+| `c8a-48xl` | `c8a.metal-48xl` | EPYC Turin | 2 × 96 | already off | NPS1 | 2 | 8-core CCX |
 
-The `c8i` and `c8a` socket/CCX layouts are best-known planning defaults, not measured — the
-generation is new enough that AWS may present it differently. Confirm on first contact with
-the hardware (`lltune topology --live`); if SNC is enabled on Xeon 6 you will see 2–3 NUMA
-nodes per socket and the profile needs updating. Nothing downstream depends on the profile
-being right when you install with `--live`.
+These are the only compute-optimised metal SKUs that exist: there is no `c8i.metal-24xl`,
+no `c8a.metal-96xl`, and c7a's only bare-metal size is the 48xl.
+
+**Granite Rapids is not one NUMA node per socket.** Xeon 6900P is three compute dies per
+socket, and SNC3 — Intel's default, and the mode AWS runs — exposes each die as its own NUMA
+domain. A `c8i.metal-96xl` is **six** NUMA nodes of 32 cores, not two of 96. Since
+housekeeping and IRQ cores are reserved per node, assuming two would reserve 8 cores where
+the correct answer is 24, and would leave four of the six domains with no local housekeeping
+core at all. `docs/DESIGN.md` §2 draws the full topology and the NIC-locality consequence.
+
+Each profile carries a `confidence` block recording what is verified against AWS/Intel
+documentation and what is inferred. The AMD NPS setting and Turin's CCX size are inferred —
+NPS is a BIOS setting invisible from outside. On first contact with a shape run
+`lltune topology --live` and correct the profile; `lltune validate` fails outright if the
+host's NUMA node count disagrees with the installed plan.
 
 Profiles exist so you can plan and review a shape you are not currently logged into (and
 bake a plan into an AMI). **On the host, `--live` is authoritative** — it reads sysfs and

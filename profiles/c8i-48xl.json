@@ -1,14 +1,19 @@
 {
   "name": "c8i-48xl",
-  "description": "c8i.metal-48xl - Intel Xeon 6 (Granite Rapids), single socket",
+  "description": "c8i.metal-48xl - custom Intel Xeon 6 (Granite Rapids), single socket, SNC3",
   "vendor": "intel",
   "metal_sku": "c8i.metal-48xl",
   "vcpus": 192,
   "sockets": 1,
   "cores_per_socket": 96,
   "threads_per_core": 2,
-  "numa_nodes": 1,
-  "cores_per_l3": 96,
-  "_cores_per_l3": "Granite Rapids is multi-die but presents a unified per-socket L3 unless SNC is on. Confirm with --live: if SNC is enabled you will see 2-3 NUMA nodes per socket and this profile is wrong.",
-  "nic_numa_node": 0
+  "numa_nodes": 3,
+  "cores_per_l3": 32,
+  "nic_numa_node": 0,
+  "numa_mode": "SNC3 - each of the 3 compute dies is its own NUMA domain, with its own L3 slice and 4 memory channels",
+  "confidence": {
+    "sku_and_vcpus": "verified - AWS c8i instance page",
+    "numa_nodes": "SNC3 is Intel's default on Xeon 6900P and is the mode AWS runs. 3 dies per socket => 3 NUMA nodes, 32 cores each.",
+    "cores_per_l3": "SNC3 restricts L3 to each compute die: 96 cores / 3 dies = 32 cores per L3 domain."
+  }
 }

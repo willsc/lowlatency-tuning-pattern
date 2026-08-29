@@ -1,13 +1,20 @@
 {
   "name": "c8i-96xl",
-  "description": "c8i.metal-96xl - Intel Xeon 6 (Granite Rapids), dual socket",
+  "description": "c8i.metal-96xl - custom Intel Xeon 6975P-C (Granite Rapids), dual socket, SNC3",
   "vendor": "intel",
   "metal_sku": "c8i.metal-96xl",
   "vcpus": 384,
   "sockets": 2,
   "cores_per_socket": 96,
   "threads_per_core": 2,
-  "numa_nodes": 2,
-  "cores_per_l3": 96,
-  "nic_numa_node": 0
+  "numa_nodes": 6,
+  "cores_per_l3": 32,
+  "nic_numa_node": 0,
+  "numa_mode": "SNC3 - 3 compute dies per socket x 2 sockets = 6 NUMA domains of 32 cores",
+  "confidence": {
+    "sku_and_vcpus": "verified - AWS c8i instance page",
+    "cpu_model": "verified - Intel Xeon 6975P-C, 192 physical / 384 logical, 960 MiB L3 total (480 per socket)",
+    "numa_nodes": "SNC3 default on Xeon 6900P, confirmed as AWS's chosen mode. 2 sockets x 3 dies = 6 NUMA nodes.",
+    "cores_per_l3": "480 MiB per socket / 3 dies = 160 MiB per die; 96 cores / 3 = 32 cores per L3 domain."
+  }
 }

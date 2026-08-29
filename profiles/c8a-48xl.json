@@ -1,14 +1,19 @@
 {
   "name": "c8a-48xl",
-  "description": "c8a.metal-48xl - AMD EPYC 9005 (Turin), single socket. SMT disabled.",
+  "description": "c8a.metal-48xl - AMD EPYC 5th gen (Turin), dual socket. SMT disabled by AWS.",
   "vendor": "amd",
   "metal_sku": "c8a.metal-48xl",
   "vcpus": 192,
-  "sockets": 1,
-  "cores_per_socket": 192,
+  "sockets": 2,
+  "cores_per_socket": 96,
   "threads_per_core": 1,
-  "numa_nodes": 1,
-  "cores_per_l3": 16,
-  "_cores_per_l3": "Turin dense (Zen 5c) uses a 16-core CCX. If this host is classic Zen 5, it is 8 - check with --live, it changes where the exclusive block starts.",
-  "nic_numa_node": 0
+  "numa_nodes": 2,
+  "cores_per_l3": 8,
+  "nic_numa_node": 0,
+  "numa_mode": "NPS1 - 1 NUMA node per socket",
+  "confidence": {
+    "sku_and_vcpus": "verified - AWS c8a instance page. c8a tops out at 48xl; there is no c8a.metal-96xl.",
+    "cores_per_l3": "ASSUMED classic Zen 5 (8-core CCX). Confirm with --live.",
+    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'."
+  }
 }
