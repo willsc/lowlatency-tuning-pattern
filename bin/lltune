@@ -548,6 +548,71 @@ def cmd_render(args):
     print(f"rendered into {out}")
 
 
+def cmd_layers(args):
+    """Dump every configuration layer for a profile, in the order it is applied."""
+    plan = plan_for(args)
+    t = plan["topology"]
+    out = {
+        "profile": plan["profile"],
+        "topology": t,
+        "roles": plan["roles"],
+        "nodes": plan["nodes"],
+        "layers": {
+            "1_boot_grub": {
+                "file": "/etc/default/grub.d/99-lowlatency.cfg",
+                "applies": "at boot, requires reboot",
+                "cmdline": plan["cmdline"],
+                "args": plan["cmdline"].split(),
+            },
+            "2_cgroup_slices": {
+                "applies": "systemctl daemon-reload, immediate",
+                "units": {name: body for name, body in render_slices(plan).items()},
+            },
+            "3_runtime": {
+                "file": "scripts/apply-runtime.sh",
+                "applies": "every boot via lltune-runtime.service",
+                "irq_landing_cpus": plan["irq_landing_cpus"],
+                "ena_combined_queues": len(expand(plan["roles"]["irqnet"]["cpus"])),
+                "workqueue_cpumask": plan["non_isolated_cpus"],
+                "xps_source_cpus": plan["roles"]["exclusive"]["cpus"],
+            },
+            "4_app_contract": {
+                "file": "/etc/lowlatency/cores.env",
+                "env": render_cores_env(plan),
+            },
+        },
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+
+    bar = "=" * 78
+    print(bar)
+    print(f"{plan['profile']}   {t['vendor']}  {t['sockets']}s x "
+          f"{t['total_cores'] // t['sockets']}c  |  {t['numa_nodes']} NUMA node(s)  |  "
+          f"SMT {plan['policy'].get('smt')}  |  L3 domain {t['cores_per_l3']} cores")
+    print(bar)
+    print("\n--- LAYER 1: GRUB (boot, needs reboot) "
+          "-> /etc/default/grub.d/99-lowlatency.cfg\n")
+    for a in plan["cmdline"].split():
+        print(f"    {a}")
+    print("\n--- LAYER 2: cgroup slices (immediate) -> /etc/systemd/system/\n")
+    for name, body in render_slices(plan).items():
+        cpus = re.search(r"AllowedCPUs=(\S+)", body).group(1)
+        print(f"    {name:<38} AllowedCPUs={cpus}")
+    print("\n--- LAYER 3: runtime (every boot) -> lltune-runtime.service\n")
+    r = out["layers"]["3_runtime"]
+    print(f"    IRQ affinity            {r['irq_landing_cpus']}")
+    print(f"    ENA combined queues     {r['ena_combined_queues']}  (clamped to irqnet core count)")
+    print(f"    workqueue cpumask       {r['workqueue_cpumask']}")
+    print(f"    XPS source cpus         {r['xps_source_cpus']}")
+    print("\n--- LAYER 4: application contract -> /etc/lowlatency/cores.env\n")
+    for line in render_cores_env(plan).splitlines():
+        if line and not line.startswith("#"):
+            print(f"    {line}")
+    print()
+
+
 def current_plan(args=None):
     if PLAN_PATH.exists():
         return json.loads(PLAN_PATH.read_text())
@@ -768,6 +833,11 @@ def main():
     p = sub.add_parser("render", help="render grub / slices / cores.env from a plan")
     src(p); p.add_argument("--plan"); p.add_argument("-o", "--out", default="./out")
     p.set_defaults(fn=cmd_render)
+
+    p = sub.add_parser("layers", help="dump every config layer for a profile")
+    src(p); p.add_argument("--plan"); p.add_argument("--policy")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(fn=cmd_layers)
 
     p = sub.add_parser("validate", help="verify the running host matches the plan")
     p.add_argument("--plan"); p.add_argument("-q", "--quiet", action="store_true",
