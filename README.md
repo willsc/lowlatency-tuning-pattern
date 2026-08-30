@@ -30,29 +30,30 @@ SHARED_CORES=9-23,105-119         # non-isolated, load-balanced app pool
 
 ## The layers
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c8i-96xl-dark.svg">
-  <img src="docs/diagrams/c8i-96xl.svg" alt="The four configuration layers stacked above the machine for c8i.metal-96xl, each rendered from one plan.json">
-</picture>
+```mermaid
+flowchart BT
+  M["THE MACHINE<br/>cores · NUMA nodes · L3 domains"]
+  L1["LAYER 1 — kernel boot<br/>isolcpus · nohz_full · rcu_nocbs · irqaffinity<br/>grub.d/99-lowlatency.cfg · needs a reboot"]
+  L2["LAYER 2 — cgroup v2 cpusets<br/>system.slice · irqnet.slice · pulsar.slice<br/>/etc/systemd/system/ · daemon-reload"]
+  L3["LAYER 3 — runtime pinning<br/>IRQ affinity · NIC queues · workqueues · XPS<br/>apply-runtime.sh · every boot"]
+  L4["LAYER 4 — application<br/>SHARED_CORES · EXCLUSIVE_CORES<br/>/etc/lowlatency/cores.env · read at start"]
+  P(["plan.json"])
 
-Read it upward. The machine offers 192 cores in six SNC3 NUMA domains; the kernel drops the
-exclusive set from its scheduler domains; systemd fences that same set in a cpuset; the
-runtime steers interrupts and kernel threads away from it; the application is handed the
-list as a string. The arrow between layers 1 and 2 is the only hard constraint in the
-design — a `pulsar.slice` whose `AllowedCPUs` disagreed with `isolcpus` would keep serving
-traffic while its tail latency doubled, and nothing checks it at runtime. That is why all
-four layers are rendered from one `plan.json`.
+  M --> L1
+  L1 -- "AllowedCPUs must equal isolcpus" --> L2
+  L2 --> L3
+  L3 --> L4
 
-One diagram per shape, with that shape's real CPU lists, in
-[`docs/diagrams/`](docs/diagrams/) — light and dark `.svg`, plus a `.png` for slides:
+  P -.-> L1
+  P -.-> L2
+  P -.-> L3
+  P -.-> L4
+```
 
-| | | |
-|---|---|---|
-| [c7i-24xl](docs/diagrams/c7i-24xl.svg) | [c7i-48xl](docs/diagrams/c7i-48xl.svg) | [c8i-48xl](docs/diagrams/c8i-48xl.svg) |
-| [c8i-96xl](docs/diagrams/c8i-96xl.svg) | [c7a-48xl](docs/diagrams/c7a-48xl.svg) | [c8a-24xl](docs/diagrams/c8a-24xl.svg) |
-| [c8a-48xl](docs/diagrams/c8a-48xl.svg) | | |
-
-Redraw them all with `./scripts/build-layers-diagram.py`.
+Four layers, one set of cores. The arrow from layer 1 to layer 2 is the only hard
+constraint: nothing checks it at runtime, so a `pulsar.slice` that disagreed with
+`isolcpus` would keep serving traffic while its tail latency doubled. That is why all four
+are rendered from one `plan.json`.
 
 ## Why it is built this way
 
@@ -101,37 +102,30 @@ scripts/uninstall.sh        full rollback
 scripts/jitter-test.sh      cyclictest / hwlatdetect acceptance gate
 scripts/selftest.py         planner invariants — run after any policy/profile change
 scripts/docgen_common.py    shared material for the two doc generators
-scripts/build-layers-diagram.py    redraw docs/layers.html
 scripts/build-config-reference.py  regenerate docs/CONFIG-REFERENCE.md
 systemd/                    lltune-runtime.service, lltune-validate.service, app example
 sysctl/99-lowlatency.conf   runtime-only kernel knobs
 tuned/lowlatency-pulsar/    optional tuned delivery of the runtime layer (AL2023/RHEL)
 docs/DESIGN.md              why each knob is set, and what it costs
 docs/RUNBOOK.md             apply, verify, roll back, debug a regression
-docs/diagrams/*.svg|png     generated: the layer diagram, one per shape, light + dark
-docs/layers.html            the same diagrams as one browsable page
 docs/CONFIG-REFERENCE.md    generated: GRUB isolation + cgroup slices, every shape, verbatim
 ```
 
 ## Generated documentation
 
-Two documents describe the installed configuration for all seven shapes. Both are
-**generated from the planner**, never hand-written, so neither can drift from what
-`install.sh` would actually apply — a document with stale CPU lists in it is the same
-silent failure as a stale config file.
+`docs/CONFIG-REFERENCE.md` is **generated from the planner**, never hand-written, so it
+cannot drift from what `install.sh` would actually apply — a document with stale CPU lists
+in it is the same silent failure as a stale config file.
 
 | Document | What it is for |
 |---|---|
 | [`docs/CONFIG-REFERENCE.md`](docs/CONFIG-REFERENCE.md) | The **boot isolation (GRUB) and cgroup slice** layers, every shape: which arguments are constant and which carry a CPU list, `AllowedCPUs` for every unit, and the verbatim contents of all seven `99-lowlatency.cfg` files and forty-two systemd units. Greppable and diffable in review. |
-| [`docs/diagrams/`](docs/diagrams/) | The **layer diagram**, one standalone SVG per shape (plus a dark variant and a PNG). Self-contained — no CSS, no fonts, no script — so it renders anywhere: GitHub, a wiki, a slide. |
-| [`docs/layers.html`](docs/layers.html) | The same seven diagrams as one browsable page with a shape switcher. |
 
 ```sh
 ./bin/lltune layers --profile c8i-96xl     # the same material, in the terminal
 ./bin/lltune render --live -o out/         # the real files, for the host you are on
 
 ./scripts/build-config-reference.py        # regenerate after any policy or profile change
-./scripts/build-layers-diagram.py
 ```
 
 `build-config-reference.py` re-checks the cross-layer invariants as it writes — that
