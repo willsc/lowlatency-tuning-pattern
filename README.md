@@ -75,14 +75,14 @@ scripts/uninstall.sh        full rollback
 scripts/jitter-test.sh      cyclictest / hwlatdetect acceptance gate
 scripts/selftest.py         planner invariants — run after any policy/profile change
 scripts/docgen_common.py    shared material for the two doc generators
-scripts/build-layers-page.py       regenerate docs/layers.html
+scripts/build-layers-diagram.py    redraw docs/layers.html
 scripts/build-config-reference.py  regenerate docs/CONFIG-REFERENCE.md
 systemd/                    lltune-runtime.service, lltune-validate.service, app example
 sysctl/99-lowlatency.conf   runtime-only kernel knobs
 tuned/lowlatency-pulsar/    optional tuned delivery of the runtime layer (AL2023/RHEL)
 docs/DESIGN.md              why each knob is set, and what it costs
 docs/RUNBOOK.md             apply, verify, roll back, debug a regression
-docs/layers.html            generated: all four layers, per shape, side by side
+docs/layers.html            generated: a drawing of all four layers, per shape
 docs/CONFIG-REFERENCE.md    generated: GRUB isolation + cgroup slices, every shape, verbatim
 ```
 
@@ -96,14 +96,14 @@ silent failure as a stale config file.
 | Document | What it is for |
 |---|---|
 | [`docs/CONFIG-REFERENCE.md`](docs/CONFIG-REFERENCE.md) | The **boot isolation (GRUB) and cgroup slice** layers, every shape: which arguments are constant and which carry a CPU list, `AllowedCPUs` for every unit, and the verbatim contents of all seven `99-lowlatency.cfg` files and forty-two systemd units. Greppable and diffable in review. |
-| [`docs/layers.html`](docs/layers.html) | All **four** layers, interactive: a per-NUMA-node core map, the cmdline annotated argument by argument, the slice cpusets, runtime pinning and the `cores.env` contract. |
+| [`docs/layers.html`](docs/layers.html) | A **drawing**: the machine's cores along one axis, and every layer's coverage drawn beneath it in the same coordinate space. The isolated set is a shaded column running the height of the figure, so the fact that `isolcpus`, `pulsar.slice` and `EXCLUSIVE_CORES` describe one set of cores is visible rather than asserted. |
 
 ```sh
 ./bin/lltune layers --profile c8i-96xl     # the same material, in the terminal
 ./bin/lltune render --live -o out/         # the real files, for the host you are on
 
 ./scripts/build-config-reference.py        # regenerate after any policy or profile change
-./scripts/build-layers-page.py
+./scripts/build-layers-diagram.py
 ```
 
 `build-config-reference.py` re-checks the cross-layer invariants as it writes — that
