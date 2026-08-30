@@ -8,7 +8,7 @@
   --ink:#121821; --ink-2:#39444F; --muted:#65717F; --line:#D4DCE5;
   --accent:#17618F;
   --hk:#9C5B18; --irq:#0F6E66; --shr:#6A3FA0; --exc:#1F5F92;
-  --shade:#1F5F92;
+  --shade:#1F5F92; --hwband:#E7ECF2;
   --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
   --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --disp:"Archivo","IBM Plex Sans",-apple-system,sans-serif;
@@ -19,7 +19,7 @@
     --ink:#E7ECF2; --ink-2:#C3CCD7; --muted:#8C99A8; --line:#273040;
     --accent:#63A6D2;
     --hk:#E09553; --irq:#3FC2B5; --shr:#AE8FE6; --exc:#6FAEDD;
-    --shade:#6FAEDD;
+    --shade:#6FAEDD; --hwband:#1A2430;
   }
 }
 :root[data-theme="dark"]{
@@ -27,7 +27,7 @@
   --ink:#E7ECF2; --ink-2:#C3CCD7; --muted:#8C99A8; --line:#273040;
   --accent:#63A6D2;
   --hk:#E09553; --irq:#3FC2B5; --shr:#AE8FE6; --exc:#6FAEDD;
-  --shade:#6FAEDD;
+  --shade:#6FAEDD; --hwband:#1A2430;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
@@ -69,7 +69,7 @@ h2{font-family:var(--disp);font-size:23px;font-weight:600;letter-spacing:-.014em
 
 figure{margin:0;background:var(--surface);border:1px solid var(--line);border-radius:7px}
 .scroll{overflow-x:auto;padding:14px 10px 4px}
-svg.fig{display:block;width:100%;min-width:1000px;height:auto}
+svg.fig{display:block;width:100%;min-width:1060px;height:auto}
 figcaption{border-top:1px solid var(--line);padding:13px 18px;color:var(--ink-2);
            font-size:13.5px;max-width:none}
 figcaption b{color:var(--ink)}
@@ -77,27 +77,41 @@ figcaption em{color:var(--ink);font-style:italic}
 figcaption code{font-family:var(--mono);font-size:.9em;color:var(--accent)}
 
 /* ---------- inside the drawing ---------- */
-.core{stroke:var(--surface);stroke-width:.5}
-.core.hk,.bar.hk{fill:var(--hk)}
-.core.irq,.bar.irq{fill:var(--irq)}
-.core.shr,.bar.shr{fill:var(--shr)}
-.core.exc,.bar.exc{fill:var(--exc)}
-.shade{fill:var(--shade);opacity:.07}
-.l3{stroke:var(--surface);stroke-width:1.4}
-.tick{stroke:var(--line);stroke-width:1}
-.sep{stroke:var(--line);stroke-width:1}
+.band{fill:var(--sunk);stroke:var(--line);stroke-width:1}
+.band.hw{fill:var(--hwband);stroke:var(--line)}
+.box{fill:var(--surface);stroke:var(--line);stroke-width:1}
+.rail{stroke:none}
+.rail.hk{fill:var(--hk)} .rail.irq{fill:var(--irq)}
+.rail.shr{fill:var(--shr)} .rail.exc{fill:var(--exc)}
+.rail.plain{fill:var(--muted)}
+.core.hk{fill:var(--hk)} .core.irq{fill:var(--irq)}
+.core.shr{fill:var(--shr)} .core.exc{fill:var(--exc)}
+.socket{fill:var(--surface);stroke:var(--line);stroke-width:1}
+
 text{font-family:var(--mono)}
 .mid{text-anchor:middle} .end{text-anchor:end}
-.lbl{font-size:10.5px;fill:var(--muted);letter-spacing:.06em;text-transform:uppercase}
-.num{font-size:10px;fill:var(--muted)}
-.mech{font-size:11px;fill:var(--ink-2);font-weight:500}
 .lnum{font-size:10.5px;font-weight:600;fill:var(--accent);letter-spacing:.09em}
-.ltitle{font-family:var(--sans);font-size:13px;font-weight:600;fill:var(--ink)}
-.lpath{font-size:10.5px;fill:var(--muted)}
-.lwhen{font-size:10.5px;fill:var(--muted)}
-.src{font-size:10.5px;font-weight:600;fill:var(--accent);letter-spacing:.04em}
-.spine{stroke:var(--accent);stroke-width:1;opacity:.45}
-.spinedot{fill:var(--accent)}
+.btitle{font-family:var(--sans);font-size:13.5px;font-weight:600;fill:var(--ink)}
+.bpath{font-size:10.5px;fill:var(--muted)}
+.bwhen{font-size:10.5px;fill:var(--muted)}
+.bxt{font-size:11px;font-weight:600;fill:var(--ink)}
+.bxv{font-size:9.5px;fill:var(--ink-2)}
+.bxv.exc{fill:var(--exc)} .bxv.irq{fill:var(--irq)}
+.bxv.shr{fill:var(--shr)} .bxv.hk{fill:var(--hk)}
+.nodelbl{font-size:9.5px;fill:var(--muted)}
+.socklbl{font-size:10px;fill:var(--muted);letter-spacing:.05em}
+
+.flow{stroke:var(--muted);stroke-width:1.4;fill:none}
+.flow.strong{stroke:var(--accent);stroke-width:2.2}
+.head{fill:var(--muted)} .head.strong{fill:var(--accent)}
+.flowlbl{font-size:10.5px;fill:var(--muted)}
+.flowlbl.strong{fill:var(--accent);font-weight:600}
+
+.planbox{fill:var(--surface);stroke:var(--accent);stroke-width:1.4}
+.plantxt{font-size:11px;font-weight:600;fill:var(--accent)}
+.railline{stroke:var(--accent);stroke-width:1;opacity:.5;fill:none}
+.rhead{fill:var(--accent);opacity:.6}
+.railtxt{font-size:9.5px;fill:var(--muted)}
 
 footer{margin-top:44px;padding-top:20px;border-top:1px solid var(--line);
        color:var(--muted);font-size:12.5px}
@@ -109,10 +123,10 @@ footer code{font-family:var(--mono)}
   <div class="top-in">
     <p class="eyebrow">AWS bare metal · compute-optimised</p>
     <h1>Core Partition Layers</h1>
-    <p class="lede">Four unrelated kernel mechanisms have to agree about one set of CPUs.
-    Each figure draws all four against the same core axis, so agreement is something you can
-    see rather than something you have to check. Every figure is rendered from the same
-    <code>plan.json</code> the installer applies.</p>
+    <p class="lede">Four layers sit between a bare-metal box and a broker that has to answer in
+    single-digit microseconds, and each one uses a different kernel mechanism to describe the
+    same set of cores. These are the layers, stacked, with the real CPU lists for every shape —
+    drawn from the same <code>plan.json</code> the installer applies.</p>
   </div>
 </header>
 
