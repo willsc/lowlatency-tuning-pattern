@@ -28,6 +28,32 @@ EXCLUSIVE_CORES=24-95,120-191     # == the isolcpus set
 SHARED_CORES=9-23,105-119         # non-isolated, load-balanced app pool
 ```
 
+## The layers
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c8i-96xl-dark.svg">
+  <img src="docs/diagrams/c8i-96xl.svg" alt="The four configuration layers stacked above the machine for c8i.metal-96xl, each rendered from one plan.json">
+</picture>
+
+Read it upward. The machine offers 192 cores in six SNC3 NUMA domains; the kernel drops the
+exclusive set from its scheduler domains; systemd fences that same set in a cpuset; the
+runtime steers interrupts and kernel threads away from it; the application is handed the
+list as a string. The arrow between layers 1 and 2 is the only hard constraint in the
+design — a `pulsar.slice` whose `AllowedCPUs` disagreed with `isolcpus` would keep serving
+traffic while its tail latency doubled, and nothing checks it at runtime. That is why all
+four layers are rendered from one `plan.json`.
+
+One diagram per shape, with that shape's real CPU lists, in
+[`docs/diagrams/`](docs/diagrams/) — light and dark `.svg`, plus a `.png` for slides:
+
+| | | |
+|---|---|---|
+| [c7i-24xl](docs/diagrams/c7i-24xl.svg) | [c7i-48xl](docs/diagrams/c7i-48xl.svg) | [c8i-48xl](docs/diagrams/c8i-48xl.svg) |
+| [c8i-96xl](docs/diagrams/c8i-96xl.svg) | [c7a-48xl](docs/diagrams/c7a-48xl.svg) | [c8a-24xl](docs/diagrams/c8a-24xl.svg) |
+| [c8a-48xl](docs/diagrams/c8a-48xl.svg) | | |
+
+Redraw them all with `./scripts/build-layers-diagram.py`.
+
 ## Why it is built this way
 
 One artifact — `plan.json` — is computed once from the machine's real topology, and the
@@ -82,7 +108,8 @@ sysctl/99-lowlatency.conf   runtime-only kernel knobs
 tuned/lowlatency-pulsar/    optional tuned delivery of the runtime layer (AL2023/RHEL)
 docs/DESIGN.md              why each knob is set, and what it costs
 docs/RUNBOOK.md             apply, verify, roll back, debug a regression
-docs/layers.html            generated: a drawing of the four-layer stack, per shape
+docs/diagrams/*.svg|png     generated: the layer diagram, one per shape, light + dark
+docs/layers.html            the same diagrams as one browsable page
 docs/CONFIG-REFERENCE.md    generated: GRUB isolation + cgroup slices, every shape, verbatim
 ```
 
@@ -96,7 +123,8 @@ silent failure as a stale config file.
 | Document | What it is for |
 |---|---|
 | [`docs/CONFIG-REFERENCE.md`](docs/CONFIG-REFERENCE.md) | The **boot isolation (GRUB) and cgroup slice** layers, every shape: which arguments are constant and which carry a CPU list, `AllowedCPUs` for every unit, and the verbatim contents of all seven `99-lowlatency.cfg` files and forty-two systemd units. Greppable and diffable in review. |
-| [`docs/layers.html`](docs/layers.html) | A **drawing** of the stack: five bands — the machine, then the four layers that configure it — each carrying its real components and their real CPU lists, with labelled arrows for what each layer hands the one above and a `plan.json` rail feeding all four. |
+| [`docs/diagrams/`](docs/diagrams/) | The **layer diagram**, one standalone SVG per shape (plus a dark variant and a PNG). Self-contained — no CSS, no fonts, no script — so it renders anywhere: GitHub, a wiki, a slide. |
+| [`docs/layers.html`](docs/layers.html) | The same seven diagrams as one browsable page with a shape switcher. |
 
 ```sh
 ./bin/lltune layers --profile c8i-96xl     # the same material, in the terminal

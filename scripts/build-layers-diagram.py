@@ -10,7 +10,7 @@ The SVG is generated from the planner, so the drawing cannot drift from the plan
 
     ./scripts/build-layers-diagram.py [-o docs/layers.html]
 """
-import argparse, datetime, html, sys
+import argparse, datetime, html, re, shutil, subprocess, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -27,6 +27,87 @@ BOX_H = 62
 HDR_H = 30
 GAP = 52                          # between bands, where the arrows live
 VAL_CH = 5.55                     # approx width of one mono char at 9.5px
+
+MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+SANS = "system-ui,-apple-system,Segoe UI,Helvetica,Arial,sans-serif"
+
+PALETTE = {
+    "light": dict(bg="#FFFFFF", surface="#FFFFFF", sunk="#F5F8FA", hwband="#E9EEF3",
+                  ink="#121821", ink2="#39444F", muted="#65717F", line="#CBD5DF",
+                  accent="#17618F", hk="#9C5B18", irq="#0F6E66", shr="#6A3FA0", exc="#1F5F92"),
+    "dark":  dict(bg="#0D1117", surface="#161C24", sunk="#131A22", hwband="#1A2430",
+                  ink="#E7ECF2", ink2="#C3CCD7", muted="#8C99A8", line="#2C3646",
+                  accent="#63A6D2", hk="#E09553", irq="#3FC2B5", shr="#AE8FE6", exc="#6FAEDD"),
+}
+
+
+def styles(c):
+    """class name -> presentation attributes, for inlining into a standalone SVG."""
+    role = {"hk": c["hk"], "irq": c["irq"], "shr": c["shr"], "exc": c["exc"],
+            "neutral": c["muted"]}
+    st = {
+        "band":     f'fill="{c["sunk"]}" stroke="{c["line"]}" stroke-width="1"',
+        "hw":       f'fill="{c["hwband"]}"',
+        "box":      f'fill="{c["surface"]}" stroke="{c["line"]}" stroke-width="1"',
+        "rail":     'stroke="none"',
+        "core":     'stroke="none"',
+        "socket":   f'fill="{c["surface"]}" stroke="{c["line"]}" stroke-width="1"',
+        "mid":      'text-anchor="middle"',
+        "end":      'text-anchor="end"',
+        "lnum":     f'font-family="{MONO}" font-size="10.5" font-weight="600" '
+                    f'fill="{c["accent"]}" letter-spacing="0.9"',
+        "btitle":   f'font-family="{SANS}" font-size="13.5" font-weight="600" fill="{c["ink"]}"',
+        "bpath":    f'font-family="{MONO}" font-size="10.5" fill="{c["muted"]}"',
+        "bwhen":    f'font-family="{MONO}" font-size="10.5" fill="{c["muted"]}"',
+        "bxt":      f'font-family="{MONO}" font-size="11" font-weight="600" fill="{c["ink"]}"',
+        "bxv":      f'font-family="{MONO}" font-size="9.5" fill="{c["ink2"]}"',
+        "nodelbl":  f'font-family="{MONO}" font-size="9.5" fill="{c["muted"]}"',
+        "socklbl":  f'font-family="{MONO}" font-size="10" fill="{c["muted"]}"',
+        "flow":     f'stroke="{c["muted"]}" stroke-width="1.4" fill="none"',
+        "head":     f'fill="{c["muted"]}"',
+        "flowlbl":  f'font-family="{MONO}" font-size="10.5" fill="{c["muted"]}"',
+        "planbox":  f'fill="{c["surface"]}" stroke="{c["accent"]}" stroke-width="1.4"',
+        "plantxt":  f'font-family="{MONO}" font-size="11" font-weight="600" fill="{c["accent"]}"',
+        "railline": f'stroke="{c["accent"]}" stroke-width="1" opacity="0.5" fill="none"',
+        "rhead":    f'fill="{c["accent"]}" opacity="0.6"',
+        "railtxt":  f'font-family="{MONO}" font-size="9.5" fill="{c["muted"]}"',
+        "strong":   "",
+        "plain":    "",
+        "fig":      "",
+    }
+    return st, role
+
+
+def inline(svg, theme):
+    """Rewrite class="..." into presentation attributes for a self-contained file.
+
+    Attributes are merged into a dict rather than concatenated: a role class has to
+    override the base class's fill, and emitting both produces a duplicate attribute,
+    which is a hard XML parse error rather than a style that loses.
+    """
+    c = PALETTE[theme]
+    st, role = styles(c)
+
+    def sub(m):
+        names = m.group(1).split()
+        d = {}
+        for n in names:
+            for k, v in re.findall(r'([\w-]+)="([^"]*)"', st.get(n, "")):
+                d[k] = v
+        if {"rail", "core", "bxv"} & set(names):
+            for n in names:
+                if n in role:
+                    d["fill"] = role[n]
+        if "strong" in names:
+            if "stroke" in d:
+                d["stroke"], d["stroke-width"] = c["accent"], "2.2"
+            if d.get("fill", "none") != "none":
+                d["fill"] = c["accent"]
+            if "font-size" in d:
+                d["font-weight"] = "600"
+        return " ".join(f'{k}="{v}"' for k, v in d.items())
+
+    return re.sub(r'class="([^"]+)"', sub, svg)
 
 
 def esc(s):
@@ -48,7 +129,7 @@ def wrap(text, width_px, lines=3):
             cur = p
             if len(out) == lines - 1:
                 rest = ",".join(parts[i:])
-                out.append(rest if len(rest) <= cap else rest[:cap - 1] + "…")
+                out.append(rest if len(rest) <= cap else rest[:cap - 1] + "\u2026")
                 return out
     if cur:
         out.append(cur)
@@ -168,7 +249,7 @@ def figure(name, prof, plan):
     l1 = [("isolcpus", exc, "exc"), ("nohz_full", exc, "exc"),
           ("rcu_nocbs", exc, "exc"), ("irqaffinity", hk_irq, "irq")]
     if t["threads_per_core"] > 1:
-        l1.insert(0, ("nosmt=force", "siblings never onlined", "plain"))
+        l1.insert(0, ("nosmt=force", "siblings never onlined", "neutral"))
     l2 = [("system.slice", hk_shr, "shr"),
           ("user · machine · init", hk, "hk"),
           ("irqnet.slice", irq, "irq"),
@@ -259,9 +340,64 @@ def build():
 TEMPLATE = Path(__file__).resolve().parent / "layers-diagram.template.html"
 
 
+def write_files(figs, outdir, png=True):
+    """One self-contained .svg per shape per theme, plus a .png if a renderer exists."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    chrome = next((b for b in ("google-chrome", "chromium", "chromium-browser")
+                   if shutil.which(b)), None)
+    written = []
+    for p in figs:
+        for theme in ("light", "dark"):
+            body = inline(p["svg"], theme)
+            vb = re.search(r'viewBox="0 0 (\d+) (\d+)"', body)
+            wide, high = vb.group(1), vb.group(2)
+            body = body.replace(
+                '<svg viewBox',
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{wide}" height="{high}" viewBox',
+                1)
+            body = body.replace(
+                f'viewBox="0 0 {wide} {high}"',
+                f'viewBox="0 0 {wide} {high}"', 1)
+            # own background, so the file is legible on any page that embeds it
+            body = re.sub(r'(<defs>.*?</defs>)',
+                          f'\\1<rect width="{wide}" height="{high}" '
+                          f'fill="{PALETTE[theme]["bg"]}"/>', body, count=1, flags=re.S)
+            name = f'{p["id"]}{"" if theme == "light" else "-dark"}.svg'
+            (outdir / name).write_text(body)
+            written.append(name)
+        if png and chrome:
+            src, dst = outdir / f'{p["id"]}.svg', outdir / f'{p["id"]}.png'
+            vb = re.search(r'width="(\d+)" height="(\d+)"', src.read_text())
+            wide, high = int(vb.group(1)), int(vb.group(2))
+            shim = outdir / f'.{p["id"]}.shim.html'
+            shim.write_text(f'<body style="margin:0"><img src="{src.name}" '
+                            f'width="{wide}" height="{high}" style="display:block">')
+            # Headless chrome's viewport comes up short of --window-size, which silently
+            # crops the bottom of the drawing. Render with slack, then crop to the real box.
+            scale = 2
+            subprocess.run([chrome, "--headless", "--disable-gpu", "--no-sandbox",
+                            "--hide-scrollbars", f"--force-device-scale-factor={scale}",
+                            f"--window-size={wide},{high + 160}",
+                            f"--screenshot={dst}", f"file://{shim.resolve()}"],
+                           capture_output=True, timeout=90)
+            shim.unlink(missing_ok=True)
+            try:
+                from PIL import Image
+                im = Image.open(dst)
+                if im.size != (wide * scale, high * scale):
+                    im.crop((0, 0, wide * scale, high * scale)).save(dst)
+            except ImportError:
+                pass
+            written.append(dst.name)
+    return written
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--out", default=str(REPO / "docs" / "layers.html"))
+    ap.add_argument("-d", "--diagrams", default=str(REPO / "docs" / "diagrams"),
+                    help="directory for the standalone .svg / .png files")
+    ap.add_argument("--no-png", action="store_true")
     args = ap.parse_args()
     figs = build()
     panels = []
@@ -295,6 +431,8 @@ def main():
                      datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")))
     Path(args.out).write_text(page)
     print(f"wrote {args.out}  ({len(figs)} figures, {len(page) // 1024} KiB)")
+    files = write_files(figs, Path(args.diagrams), png=not args.no_png)
+    print(f"wrote {len(files)} files into {args.diagrams}")
 
 
 if __name__ == "__main__":
