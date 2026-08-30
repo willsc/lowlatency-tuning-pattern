@@ -30,25 +30,7 @@ SHARED_CORES=9-23,105-119         # non-isolated, load-balanced app pool
 
 ## The layers
 
-```mermaid
-flowchart BT
-  M["THE MACHINE<br/>cores · NUMA nodes · L3 domains"]
-  L1["LAYER 1 — kernel boot<br/>isolcpus · nohz_full · rcu_nocbs · irqaffinity<br/>grub.d/99-lowlatency.cfg · needs a reboot"]
-  L2["LAYER 2 — cgroup v2 cpusets<br/>system.slice · irqnet.slice · pulsar.slice<br/>/etc/systemd/system/ · daemon-reload"]
-  L3["LAYER 3 — runtime pinning<br/>IRQ affinity · NIC queues · workqueues · XPS<br/>apply-runtime.sh · every boot"]
-  L4["LAYER 4 — application<br/>SHARED_CORES · EXCLUSIVE_CORES<br/>/etc/lowlatency/cores.env · read at start"]
-  P(["plan.json"])
-
-  M --> L1
-  L1 -- "AllowedCPUs must equal isolcpus" --> L2
-  L2 --> L3
-  L3 --> L4
-
-  P -.-> L1
-  P -.-> L2
-  P -.-> L3
-  P -.-> L4
-```
+![The four configuration layers stacked above the machine, all rendered from one plan.json](docs/layers.png)
 
 Four layers, one set of cores. The arrow from layer 1 to layer 2 is the only hard
 constraint: nothing checks it at runtime, so a `pulsar.slice` that disagreed with
@@ -106,6 +88,7 @@ scripts/build-config-reference.py  regenerate docs/CONFIG-REFERENCE.md
 systemd/                    lltune-runtime.service, lltune-validate.service, app example
 sysctl/99-lowlatency.conf   runtime-only kernel knobs
 tuned/lowlatency-pulsar/    optional tuned delivery of the runtime layer (AL2023/RHEL)
+docs/layers.svg | .png      the diagram above
 docs/DESIGN.md              why each knob is set, and what it costs
 docs/RUNBOOK.md             apply, verify, roll back, debug a regression
 docs/CONFIG-REFERENCE.md    generated: GRUB isolation + cgroup slices, every shape, verbatim
