@@ -4,6 +4,9 @@
 #   ./scripts/install.sh --live                 plan from the real topology (normal case)
 #   ./scripts/install.sh --profile c7a-48xl     plan from a profile (bake into an AMI)
 #   ./scripts/install.sh --live --no-boot       cgroup + runtime only, no reboot needed
+#   ./scripts/install.sh --plan /path/plan.json install a plan that was computed earlier
+#
+# scripts/apply.sh is the front door: it shows the diff first and calls this to write.
 #
 # The boot layer needs a reboot. Nothing else does.
 set -euo pipefail
@@ -14,6 +17,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 SRC=(--live)
+PLAN_IN=""
 DO_BOOT=1
 DO_RUNTIME=1
 EXTRA=()
@@ -22,21 +26,29 @@ while (( $# )); do
   case $1 in
     --live)        SRC=(--live); shift ;;
     --profile)     SRC=(--profile "$2"); shift 2 ;;
+    --plan)        PLAN_IN=$2; shift 2 ;;
     --policy)      EXTRA+=(--policy "$2"); shift 2 ;;
     --shared-ratio) EXTRA+=(--shared-ratio "$2"); shift 2 ;;
     --mitigations-off) EXTRA+=(--mitigations-off); shift ;;
     --hugepages-1g-per-node) EXTRA+=(--hugepages-1g-per-node "$2"); shift 2 ;;
     --no-boot)     DO_BOOT=0; shift ;;
     --no-runtime)  DO_RUNTIME=0; shift ;;
-    -h|--help)     sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 
-echo "==> planning"
-"$REPO/bin/lltune" plan "${SRC[@]}" "${EXTRA[@]}" -o "$STAGE/plan.json"
+if [[ -n $PLAN_IN ]]; then
+  # Install exactly the plan the caller already computed and showed. Re-planning here
+  # would mean the host could get something other than what was reviewed.
+  echo "==> using plan $PLAN_IN"
+  install -m 0644 "$PLAN_IN" "$STAGE/plan.json"
+else
+  echo "==> planning"
+  "$REPO/bin/lltune" plan "${SRC[@]}" "${EXTRA[@]}" -o "$STAGE/plan.json"
+fi
 "$REPO/bin/lltune" render --plan "$STAGE/plan.json" -o "$STAGE/out"
 "$REPO/bin/lltune" show  --plan "$STAGE/plan.json"
 

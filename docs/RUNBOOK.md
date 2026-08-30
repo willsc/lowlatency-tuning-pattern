@@ -2,30 +2,57 @@
 
 ## Apply to a new host
 
+`scripts/apply.sh` is the front door. Run it with no arguments first: it plans from the
+host's real topology and prints every file it would write, diffed against what is already
+there, without touching anything.
+
 ```sh
 git clone <this repo> /opt/lowlatency-tuning-pattern
 cd /opt/lowlatency-tuning-pattern
 
-sudo ./scripts/install.sh --live          # prints the plan, then installs all three layers
-# review the core map it prints before rebooting
+./scripts/apply.sh                        # DRY RUN - writes nothing, needs no root
+sudo ./scripts/apply.sh --apply           # same plan, actually installed (asks first)
 sudo reboot
 
 ./bin/lltune validate                     # must be 0 failed
 sudo ./scripts/jitter-test.sh 300         # acceptance gate
 ```
 
-`install.sh` is idempotent. Re-running it re-plans, re-renders and re-installs; only the
-boot layer needs the reboot.
+The dry run and the apply use the **same** plan: `--apply` hands the plan it just showed
+you to `install.sh` rather than recomputing one, so the host cannot get something other
+than what you reviewed.
+
+What the dry run shows, layer by layer:
+
+| Section | What you are checking |
+|---|---|
+| `PLAN` | the core map: how many cores each role gets, on which NUMA node |
+| `LAYER 1` | the GRUB file diff, then which planned arguments are missing from `/proc/cmdline` — this is what decides whether a reboot is required |
+| `LAYER 2` | the six unit files diffed, then the planned cpusets against the **live** ones in `/sys/fs/cgroup` |
+| `LAYER 3` | every runtime write `apply-runtime.sh` would make, with per-CPU paths collapsed |
+| `LAYER 4` | `cores.env`, `plan.json` and the sysctl file diffed |
+| `SUMMARY` | counts, and whether a reboot is needed |
 
 ### Variants
 
 ```sh
-sudo ./scripts/install.sh --live --no-boot                 # cgroups + runtime only, no reboot
-sudo ./scripts/install.sh --profile c7a-48xl               # bake into an AMI, no live host needed
-sudo ./scripts/install.sh --live --shared-ratio 0.20       # bigger shared pool
-sudo ./scripts/install.sh --live --hugepages-1g-per-node 32
-sudo ./scripts/install.sh --live --mitigations-off         # read docs/DESIGN.md §3 first
+./scripts/apply.sh --profile c7a-48xl     # dry-run a shape you are not logged into
+./scripts/apply.sh --brief                # statuses only, no diffs
+./scripts/apply.sh --full                 # never truncate a diff
+
+sudo ./scripts/apply.sh --apply --no-boot                 # cgroups + runtime only, no reboot
+sudo ./scripts/apply.sh --apply --yes                     # skip the confirmation prompt
+sudo ./scripts/apply.sh --apply --shared-ratio 0.20       # bigger shared pool
+sudo ./scripts/apply.sh --apply --hugepages-1g-per-node 32
+sudo ./scripts/apply.sh --apply --mitigations-off         # read docs/DESIGN.md §3 first
 ```
+
+`--apply` refuses to run without a TTY unless you pass `--yes`, so a CI job or an
+Ansible task has to opt in explicitly rather than doing it by accident.
+
+`scripts/install.sh` is still there and does the actual writing; call it directly only if
+you want the install without the review step. Both are idempotent — re-running re-plans,
+re-renders and re-installs, and only the boot layer needs the reboot.
 
 ## Change the core split on a running fleet
 
@@ -33,7 +60,8 @@ Changing `shared_ratio` moves the boundary between shared and exclusive, which c
 `isolcpus` — so it is a **reboot**, not a live change.
 
 ```sh
-sudo ./scripts/install.sh --live --shared-ratio 0.20
+./scripts/apply.sh --shared-ratio 0.20         # see exactly which cores move first
+sudo ./scripts/apply.sh --apply --shared-ratio 0.20
 # drain the node, then:
 sudo reboot
 ./bin/lltune validate

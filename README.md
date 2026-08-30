@@ -39,17 +39,27 @@ A broker keeps serving traffic while its p99.9 quietly doubles.
 ## Quick start
 
 ```sh
-# See the plan for a shape you do not have in front of you
-./bin/lltune show --profile c7a-48xl
-./bin/lltune show --profile c8i-96xl
+# Dry run: plan from this machine's real topology and show every file that would
+# change, diffed against what is already on disk. Writes nothing, needs no root.
+./scripts/apply.sh
 
-# Plan from the real machine and install everything
-sudo ./scripts/install.sh --live
+# Same plan, actually installed. Asks before it writes.
+sudo ./scripts/apply.sh --apply
 sudo reboot
 
 # After reboot, prove it took
 ./bin/lltune validate
 sudo ./scripts/jitter-test.sh
+```
+
+`apply.sh` is the front door for everything: it plans, shows you the diff for all four
+layers, tells you whether a reboot is actually needed, and only then applies. The plan it
+shows is the plan it installs — `--apply` hands that exact `plan.json` to `install.sh`
+rather than recomputing one.
+
+```sh
+./scripts/apply.sh --profile c8i-96xl   # dry-run a shape you are not logged into
+./bin/lltune show --profile c7a-48xl    # just the core map
 ```
 
 ## Layout
@@ -58,6 +68,7 @@ sudo ./scripts/jitter-test.sh
 bin/lltune                  plan / render / show / validate  (the whole brain)
 profiles/*.json             per-instance-shape topology descriptors
 profiles/policy.json        the tuning policy: ratios, C-states, mitigations
+scripts/apply.sh            THE FRONT DOOR: dry-run the whole config, then --apply it
 scripts/install.sh          render + install boot, cgroup and runtime layers
 scripts/apply-runtime.sh    IRQ, ENA queues, XPS, workqueues, power  (runs every boot)
 scripts/uninstall.sh        full rollback
