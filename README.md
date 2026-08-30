@@ -37,6 +37,11 @@ constraint: nothing checks it at runtime, so a `pulsar.slice` that disagreed wit
 `isolcpus` would keep serving traffic while its tail latency doubled. That is why all four
 are rendered from one `plan.json`.
 
+**[`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) has the same diagram for each of the
+seven metal shapes**, annotated with that shape's real core allocation and the actual
+values every layer installs — kernel arguments, cgroup cpusets, runtime pinning targets and
+the application's core contract, plus the per-NUMA-node breakdown.
+
 ## Why it is built this way
 
 One artifact — `plan.json` — is computed once from the machine's real topology, and the
@@ -89,6 +94,8 @@ systemd/                    lltune-runtime.service, lltune-validate.service, app
 sysctl/99-lowlatency.conf   runtime-only kernel knobs
 tuned/lowlatency-pulsar/    optional tuned delivery of the runtime layer (AL2023/RHEL)
 docs/layers.svg | .png      the diagram above
+docs/ARCHITECTURES.md       the same diagram per shape, with configs annotated
+docs/diagrams/              those seven diagrams, svg + png
 docs/DESIGN.md              why each knob is set, and what it costs
 docs/RUNBOOK.md             apply, verify, roll back, debug a regression
 docs/CONFIG-REFERENCE.md    generated: GRUB isolation + cgroup slices, every shape, verbatim
