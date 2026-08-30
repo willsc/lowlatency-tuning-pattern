@@ -548,6 +548,71 @@ def cmd_render(args):
     print(f"rendered into {out}")
 
 
+def cmd_layers(args):
+    """Dump every configuration layer for a profile, in the order it is applied."""
+    plan = plan_for(args)
+    t = plan["topology"]
+    out = {
+        "profile": plan["profile"],
+        "topology": t,
+        "roles": plan["roles"],
+        "nodes": plan["nodes"],
+        "layers": {
+            "1_boot_grub": {
+                "file": "/etc/default/grub.d/99-lowlatency.cfg",
+                "applies": "at boot, requires reboot",
+                "cmdline": plan["cmdline"],
+                "args": plan["cmdline"].split(),
+            },
+            "2_cgroup_slices": {
+                "applies": "systemctl daemon-reload, immediate",
+                "units": {name: body for name, body in render_slices(plan).items()},
+            },
+            "3_runtime": {
+                "file": "scripts/apply-runtime.sh",
+                "applies": "every boot via lltune-runtime.service",
+                "irq_landing_cpus": plan["irq_landing_cpus"],
+                "ena_combined_queues": len(expand(plan["roles"]["irqnet"]["cpus"])),
+                "workqueue_cpumask": plan["non_isolated_cpus"],
+                "xps_source_cpus": plan["roles"]["exclusive"]["cpus"],
+            },
+            "4_app_contract": {
+                "file": "/etc/lowlatency/cores.env",
+                "env": render_cores_env(plan),
+            },
+        },
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+
+    bar = "=" * 78
+    print(bar)
+    print(f"{plan['profile']}   {t['vendor']}  {t['sockets']}s x "
+          f"{t['total_cores'] // t['sockets']}c  |  {t['numa_nodes']} NUMA node(s)  |  "
+          f"SMT {plan['policy'].get('smt')}  |  L3 domain {t['cores_per_l3']} cores")
+    print(bar)
+    print("\n--- LAYER 1: GRUB (boot, needs reboot) "
+          "-> /etc/default/grub.d/99-lowlatency.cfg\n")
+    for a in plan["cmdline"].split():
+        print(f"    {a}")
+    print("\n--- LAYER 2: cgroup slices (immediate) -> /etc/systemd/system/\n")
+    for name, body in render_slices(plan).items():
+        cpus = re.search(r"AllowedCPUs=(\S+)", body).group(1)
+        print(f"    {name:<38} AllowedCPUs={cpus}")
+    print("\n--- LAYER 3: runtime (every boot) -> lltune-runtime.service\n")
+    r = out["layers"]["3_runtime"]
+    print(f"    IRQ affinity            {r['irq_landing_cpus']}")
+    print(f"    ENA combined queues     {r['ena_combined_queues']}  (clamped to irqnet core count)")
+    print(f"    workqueue cpumask       {r['workqueue_cpumask']}")
+    print(f"    XPS source cpus         {r['xps_source_cpus']}")
+    print("\n--- LAYER 4: application contract -> /etc/lowlatency/cores.env\n")
+    for line in render_cores_env(plan).splitlines():
+        if line and not line.startswith("#"):
+            print(f"    {line}")
+    print()
+
+
 def current_plan(args=None):
     if PLAN_PATH.exists():
         return json.loads(PLAN_PATH.read_text())
@@ -606,6 +671,30 @@ def cmd_validate(args):
 
     nb = _read("/proc/sys/kernel/numa_balancing", "0")
     c.add(nb == "0", "numa_balancing off", f"kernel.numa_balancing={nb}")
+
+    # A plan built from the wrong NUMA assumption is silently wrong: the core counts look
+    # plausible, but housekeeping and IRQ cores land in the wrong memory domains. Under
+    # SNC3 a Xeon 6 socket is 3 NUMA nodes, not 1 - getting that wrong is a 3x error in
+    # how many cores the platform reserves.
+    live_nodes = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
+    want_nodes = plan["topology"]["numa_nodes"]
+    c.add(live_nodes == want_nodes, "NUMA node count matches plan",
+          f"host has {live_nodes}, plan assumes {want_nodes}"
+          + ("" if live_nodes == want_nodes
+             else " - REPLAN with --live; the profile's numa_nodes is wrong"))
+
+    for nd in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
+        node = int(re.search(r"node(\d+)$", nd).group(1))
+        planned = next((n for n in plan["nodes"] if n["node"] == node), None)
+        if planned is None:
+            continue
+        live_cpus = set(expand(_read(f"{nd}/cpulist", "")))
+        planned_cpus = set()
+        for role in ("housekeeping", "irqnet", "shared", "exclusive"):
+            planned_cpus |= set(expand(planned[role]["cpus"]))
+        stray = planned_cpus - live_cpus
+        c.add(not stray, f"node{node} plan cpus are node-local",
+              f"{compress(stray)} planned on node{node} but live elsewhere" if stray else "clean")
 
     # --- cgroup layer -----------------------------------------------------
     cg = "/sys/fs/cgroup"
@@ -744,6 +833,11 @@ def main():
     p = sub.add_parser("render", help="render grub / slices / cores.env from a plan")
     src(p); p.add_argument("--plan"); p.add_argument("-o", "--out", default="./out")
     p.set_defaults(fn=cmd_render)
+
+    p = sub.add_parser("layers", help="dump every config layer for a profile")
+    src(p); p.add_argument("--plan"); p.add_argument("--policy")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(fn=cmd_layers)
 
     p = sub.add_parser("validate", help="verify the running host matches the plan")
     p.add_argument("--plan"); p.add_argument("-q", "--quiet", action="store_true",

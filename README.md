@@ -39,17 +39,27 @@ A broker keeps serving traffic while its p99.9 quietly doubles.
 ## Quick start
 
 ```sh
-# See the plan for a shape you do not have in front of you
-./bin/lltune show --profile c7a-48xl
-./bin/lltune show --profile c8i-96xl
+# Dry run: plan from this machine's real topology and show every file that would
+# change, diffed against what is already on disk. Writes nothing, needs no root.
+./scripts/apply.sh
 
-# Plan from the real machine and install everything
-sudo ./scripts/install.sh --live
+# Same plan, actually installed. Asks before it writes.
+sudo ./scripts/apply.sh --apply
 sudo reboot
 
 # After reboot, prove it took
 ./bin/lltune validate
 sudo ./scripts/jitter-test.sh
+```
+
+`apply.sh` is the front door for everything: it plans, shows you the diff for all four
+layers, tells you whether a reboot is actually needed, and only then applies. The plan it
+shows is the plan it installs — `--apply` hands that exact `plan.json` to `install.sh`
+rather than recomputing one.
+
+```sh
+./scripts/apply.sh --profile c8i-96xl   # dry-run a shape you are not logged into
+./bin/lltune show --profile c7a-48xl    # just the core map
 ```
 
 ## Layout
@@ -58,38 +68,76 @@ sudo ./scripts/jitter-test.sh
 bin/lltune                  plan / render / show / validate  (the whole brain)
 profiles/*.json             per-instance-shape topology descriptors
 profiles/policy.json        the tuning policy: ratios, C-states, mitigations
+scripts/apply.sh            THE FRONT DOOR: dry-run the whole config, then --apply it
 scripts/install.sh          render + install boot, cgroup and runtime layers
 scripts/apply-runtime.sh    IRQ, ENA queues, XPS, workqueues, power  (runs every boot)
 scripts/uninstall.sh        full rollback
 scripts/jitter-test.sh      cyclictest / hwlatdetect acceptance gate
 scripts/selftest.py         planner invariants — run after any policy/profile change
+scripts/docgen_common.py    shared material for the two doc generators
+scripts/build-layers-page.py       regenerate docs/layers.html
+scripts/build-config-reference.py  regenerate docs/CONFIG-REFERENCE.md
 systemd/                    lltune-runtime.service, lltune-validate.service, app example
 sysctl/99-lowlatency.conf   runtime-only kernel knobs
 tuned/lowlatency-pulsar/    optional tuned delivery of the runtime layer (AL2023/RHEL)
 docs/DESIGN.md              why each knob is set, and what it costs
 docs/RUNBOOK.md             apply, verify, roll back, debug a regression
+docs/layers.html            generated: all four layers, per shape, side by side
+docs/CONFIG-REFERENCE.md    generated: GRUB isolation + cgroup slices, every shape, verbatim
 ```
+
+## Generated documentation
+
+Two documents describe the installed configuration for all seven shapes. Both are
+**generated from the planner**, never hand-written, so neither can drift from what
+`install.sh` would actually apply — a document with stale CPU lists in it is the same
+silent failure as a stale config file.
+
+| Document | What it is for |
+|---|---|
+| [`docs/CONFIG-REFERENCE.md`](docs/CONFIG-REFERENCE.md) | The **boot isolation (GRUB) and cgroup slice** layers, every shape: which arguments are constant and which carry a CPU list, `AllowedCPUs` for every unit, and the verbatim contents of all seven `99-lowlatency.cfg` files and forty-two systemd units. Greppable and diffable in review. |
+| [`docs/layers.html`](docs/layers.html) | All **four** layers, interactive: a per-NUMA-node core map, the cmdline annotated argument by argument, the slice cpusets, runtime pinning and the `cores.env` contract. |
+
+```sh
+./bin/lltune layers --profile c8i-96xl     # the same material, in the terminal
+./bin/lltune render --live -o out/         # the real files, for the host you are on
+
+./scripts/build-config-reference.py        # regenerate after any policy or profile change
+./scripts/build-layers-page.py
+```
+
+`build-config-reference.py` re-checks the cross-layer invariants as it writes — that
+`pulsar.slice`'s `AllowedCPUs` is exactly the `isolcpus` list, that `irqaffinity` and
+`isolcpus` are disjoint, that the three cpusets partition every core — and refuses to emit a
+document describing a broken plan.
 
 ## Supported shapes
 
-| Profile | CPU | vCPU | Sockets × cores | SMT | NUMA | L3 domain |
-|---|---|---|---|---|---|---|
-| `c7i-24xl` | Sapphire Rapids | 96 | 1 × 48 | 2 → off | 1 | per-socket |
-| `c7i-48xl` | Sapphire Rapids | 192 | 2 × 48 | 2 → off | 2 | per-socket |
-| `c8i-24xl` | Xeon 6 (Granite Rapids) | 96 | 1 × 48 | 2 → off | 1 | per-socket |
-| `c8i-48xl` | Xeon 6 (Granite Rapids) | 192 | 1 × 96 | 2 → off | 1 | per-socket |
-| `c8i-96xl` | Xeon 6 (Granite Rapids) | 384 | 2 × 96 | 2 → off | 2 | per-socket |
-| `c7a-24xl` | EPYC 9R14 (Genoa) | 96 | 1 × 96 | already off | 1 | 8-core CCX |
-| `c7a-48xl` | EPYC 9R14 (Genoa) | 192 | 2 × 96 | already off | 2 | 8-core CCX |
-| `c8a-24xl` | EPYC 9005 (Turin) | 96 | 1 × 96 | already off | 1 | 8-core CCX |
-| `c8a-48xl` | EPYC 9005 (Turin) | 192 | 1 × 192 | already off | 1 | 16-core CCX |
-| `c8a-96xl` | EPYC 9005 (Turin) | 384 | 2 × 192 | already off | 2 | 16-core CCX |
+| Profile | Metal SKU | CPU | Sockets × cores | SMT | NUMA mode | **NUMA nodes** | L3 domain |
+|---|---|---|---|---|---|---|---|
+| `c7i-24xl` | `c7i.metal-24xl` | Sapphire Rapids | 1 × 48 | 2 → off | SNC off | 1 | per socket |
+| `c7i-48xl` | `c7i.metal-48xl` | Sapphire Rapids | 2 × 48 | 2 → off | SNC off | 2 | per socket |
+| `c8i-48xl` | `c8i.metal-48xl` | Xeon 6 (Granite Rapids) | 1 × 96 | 2 → off | **SNC3** | **3** | 32 cores/die |
+| `c8i-96xl` | `c8i.metal-96xl` | Xeon 6975P-C | 2 × 96 | 2 → off | **SNC3** | **6** | 32 cores/die |
+| `c7a-48xl` | `c7a.metal-48xl` | EPYC 9R14 (Genoa) | 2 × 96 | already off | NPS1 | 2 | 8-core CCX |
+| `c8a-24xl` | `c8a.metal-24xl` | EPYC Turin | 1 × 96 | already off | NPS1 | 1 | 8-core CCX |
+| `c8a-48xl` | `c8a.metal-48xl` | EPYC Turin | 2 × 96 | already off | NPS1 | 2 | 8-core CCX |
 
-The `c8i` and `c8a` socket/CCX layouts are best-known planning defaults, not measured — the
-generation is new enough that AWS may present it differently. Confirm on first contact with
-the hardware (`lltune topology --live`); if SNC is enabled on Xeon 6 you will see 2–3 NUMA
-nodes per socket and the profile needs updating. Nothing downstream depends on the profile
-being right when you install with `--live`.
+These are the only compute-optimised metal SKUs that exist: there is no `c8i.metal-24xl`,
+no `c8a.metal-96xl`, and c7a's only bare-metal size is the 48xl.
+
+**Granite Rapids is not one NUMA node per socket.** Xeon 6900P is three compute dies per
+socket, and SNC3 — Intel's default, and the mode AWS runs — exposes each die as its own NUMA
+domain. A `c8i.metal-96xl` is **six** NUMA nodes of 32 cores, not two of 96. Since
+housekeeping and IRQ cores are reserved per node, assuming two would reserve 8 cores where
+the correct answer is 24, and would leave four of the six domains with no local housekeeping
+core at all. `docs/DESIGN.md` §2 draws the full topology and the NIC-locality consequence.
+
+Each profile carries a `confidence` block recording what is verified against AWS/Intel
+documentation and what is inferred. The AMD NPS setting and Turin's CCX size are inferred —
+NPS is a BIOS setting invisible from outside. On first contact with a shape run
+`lltune topology --live` and correct the profile; `lltune validate` fails outright if the
+host's NUMA node count disagrees with the installed plan.
 
 Profiles exist so you can plan and review a shape you are not currently logged into (and
 bake a plan into an AMI). **On the host, `--live` is authoritative** — it reads sysfs and

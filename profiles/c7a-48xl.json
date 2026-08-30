@@ -1,6 +1,6 @@
 {
   "name": "c7a-48xl",
-  "description": "c7a.metal-48xl - AMD EPYC 9R14 (Genoa), dual socket. SMT already disabled by AWS.",
+  "description": "c7a.metal-48xl - AMD EPYC 9R14 (Genoa), dual socket. SMT disabled by AWS.",
   "vendor": "amd",
   "metal_sku": "c7a.metal-48xl",
   "vcpus": 192,
@@ -9,5 +9,11 @@
   "threads_per_core": 1,
   "numa_nodes": 2,
   "cores_per_l3": 8,
-  "nic_numa_node": 0
+  "nic_numa_node": 0,
+  "numa_mode": "NPS1 - 1 NUMA node per socket",
+  "confidence": {
+    "sku_and_vcpus": "verified - AWS c7a instance page. metal-48xl is the ONLY c7a bare metal size.",
+    "cpu_and_l3": "verified - EPYC 9R14, 192 physical cores, SMT off, 768 MiB L3 total / 32 MiB per CCX = 24 CCX of 8 cores",
+    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'."
+  }
 }

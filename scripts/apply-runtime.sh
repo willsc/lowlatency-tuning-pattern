@@ -17,10 +17,14 @@ log() { printf '[lltune-runtime] %s\n' "$*"; }
 w()   { # w <value> <file...>
   local val=$1; shift
   for f in "$@"; do
-    [[ -w $f ]] || continue
-    if (( DRY )); then echo "  would write '$val' -> $f"; else
-      echo "$val" > "$f" 2>/dev/null || log "WARN could not write $f"
+    if (( DRY )); then
+      [[ -e $f ]] || continue
+      if [[ -w $f ]]; then echo "  would write '$val' -> $f"
+      else echo "  would write '$val' -> $f  (needs root)"; fi
+      continue
     fi
+    [[ -w $f ]] || continue
+    echo "$val" > "$f" 2>/dev/null || log "WARN could not write $f"
   done
 }
 
@@ -57,25 +61,37 @@ for d in /proc/irq/[0-9]*; do
   [[ -f $d/smp_affinity_list ]] || continue
   # Managed IRQs (ENA, NVMe MSI-X) are owned by the kernel's affinity spreading and
   # reject writes. isolcpus=managed_irq is what keeps those off the isolated cores;
-  # the queue-count clamp below is what makes that actually fit.
-  if echo "$IRQ_LANDING" > "$d/smp_affinity_list" 2>/dev/null; then
+  # the queue-count clamp below is what makes that actually fit. A dry run counts
+  # what it would move by testing writability, without touching a single IRQ.
+  if (( DRY )); then
+    if [[ -w $d/smp_affinity_list ]]; then moved=$((moved+1)); else managed=$((managed+1)); fi
+  elif echo "$IRQ_LANDING" > "$d/smp_affinity_list" 2>/dev/null; then
     moved=$((moved+1))
   else
     managed=$((managed+1))
   fi
 done
-log "IRQs: ${moved} pinned, ${managed} kernel-managed (steered by managed_irq)"
+if (( DRY )); then
+  log "IRQs: would pin ${moved}, ${managed} kernel-managed or not writable"
+else
+  log "IRQs: ${moved} pinned, ${managed} kernel-managed (steered by managed_irq)"
+fi
 
 # irqbalance, if present, must never undo this.
 if systemctl list-unit-files irqbalance.service >/dev/null 2>&1; then
-  install -d /etc/systemd/system/irqbalance.service.d
-  cat > /etc/systemd/system/irqbalance.service.d/10-lowlatency.conf <<EOC
+  IRQB=/etc/systemd/system/irqbalance.service.d/10-lowlatency.conf
+  if (( DRY )); then
+    echo "  would write $IRQB  (bans ${ISOLATED_CPUS} from irqbalance)"
+  else
+    install -d /etc/systemd/system/irqbalance.service.d
+    cat > "$IRQB" <<EOC
 # Managed by lltune
 [Service]
 Environment=IRQBALANCE_BANNED_CPULIST=${ISOLATED_CPUS}
 Environment=IRQBALANCE_ARGS=--policyscript=/usr/local/sbin/lltune-irq-policy
 Slice=irqnet.slice
 EOC
+  fi
 fi
 
 # ---------------------------------------------------------------- 2. NIC
@@ -84,7 +100,13 @@ if [[ -n ${IFACE:-} ]] && [[ -d /sys/class/net/$IFACE ]]; then
   NIC_NODE=$(cat "/sys/class/net/$IFACE/device/numa_node" 2>/dev/null || echo 0)
   (( NIC_NODE < 0 )) && NIC_NODE=0
   n_irq=$(expand "$IRQNET_CORES" | wc -w)
-  max_q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Pre-set/,/Current/{if($1=="Combined:")print $2}' | head -1)
+  if ! command -v ethtool >/dev/null 2>&1; then
+    log "WARN ethtool not installed; skipping queue count, coalescing and ring sizing"
+  fi
+  # The trailing '|| true' matters: with 'set -o pipefail' a missing ethtool makes the
+  # whole pipeline exit 127, which under 'set -e' killed this script before it reached
+  # the workqueue, power and memory sections.
+  max_q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Pre-set/,/Current/{if($1=="Combined:")print $2}' | head -1 || true)
   max_q=${max_q:-$n_irq}
   # Clamp receive queues to the IRQ core count. ENA spreads its managed IRQs one per
   # queue; more queues than IRQ cores means the spread reaches onto isolated cores.
@@ -96,8 +118,8 @@ if [[ -n ${IFACE:-} ]] && [[ -d /sys/class/net/$IFACE ]]; then
   (( DRY )) || ethtool -C "$IFACE" adaptive-rx off adaptive-tx off rx-usecs 0 tx-usecs 0 2>/dev/null \
     || log "WARN ethtool -C partially unsupported on $IFACE"
   # Deepest available rings: absorb microbursts instead of dropping.
-  rx_max=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set/,/Current/{if($1=="RX:")print $2}' | head -1)
-  tx_max=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set/,/Current/{if($1=="TX:")print $2}' | head -1)
+  rx_max=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set/,/Current/{if($1=="RX:")print $2}' | head -1 || true)
+  tx_max=$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set/,/Current/{if($1=="TX:")print $2}' | head -1 || true)
   [[ -n ${rx_max:-} && -n ${tx_max:-} ]] && { (( DRY )) || ethtool -G "$IFACE" rx "$rx_max" tx "$tx_max" 2>/dev/null || true; }
 
   # Busy-poll style NAPI: defer the hard IRQ and let the poll loop drain the ring.

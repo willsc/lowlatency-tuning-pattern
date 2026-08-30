@@ -37,12 +37,100 @@ SMT off that is a 1:1 map, but doing it in this order means the same planner pro
 correct plan if you ever re-enable SMT, and it means the AMD 7a-family (which ships with
 SMT already disabled) needs no special-casing.
 
-## 2. Boot layer — GRUB
+## 2. NUMA topology per family — get this right first
+
+Every number in the plan derives from the NUMA node count. Get it wrong and the plan still
+*looks* reasonable — the core counts add up, the ranges are contiguous — but housekeeping and
+IRQ cores land in the wrong memory domains, and the per-node minimums reserve the wrong
+number of cores. This is the single easiest thing to be quietly wrong about, so it is
+tabulated rather than assumed.
+
+| Metal SKU | CPU | Sockets × cores | SMT | NUMA mode | **NUMA nodes** | Cores/node | L3 domain |
+|---|---|---|---|---|---|---|---|
+| `c7i.metal-24xl` | Sapphire Rapids | 1 × 48 | 2 → off | SNC off | **1** | 48 | per socket |
+| `c7i.metal-48xl` | Sapphire Rapids | 2 × 48 | 2 → off | SNC off | **2** | 48 | per socket |
+| `c8i.metal-48xl` | Xeon 6 (Granite Rapids) | 1 × 96 | 2 → off | **SNC3** | **3** | 32 | 32 cores / die |
+| `c8i.metal-96xl` | Xeon 6975P-C | 2 × 96 | 2 → off | **SNC3** | **6** | 32 | 32 cores / die |
+| `c7a.metal-48xl` | EPYC 9R14 (Genoa) | 2 × 96 | off | NPS1 | **2** | 96 | 8-core CCX |
+| `c8a.metal-24xl` | EPYC Turin | 1 × 96 | off | NPS1 | **1** | 96 | 8-core CCX |
+| `c8a.metal-48xl` | EPYC Turin | 2 × 96 | off | NPS1 | **2** | 96 | 8-core CCX |
+
+These are the only compute-optimised metal SKUs that exist. There is **no** `c8i.metal-24xl`,
+**no** `c8a.metal-96xl`, and **no** `c7a.metal-24xl` — c7a's only bare-metal size is the 48xl.
+
+### Granite Rapids is not one node per socket
+
+Xeon 6900P is built from **three compute dies per socket**, and SNC3 — Intel's default, and
+the mode AWS runs — exposes each die as its own NUMA domain with its own L3 slice and its own
+four memory channels. A `c8i.metal-96xl` is therefore **six** NUMA nodes, not two.
+
+```
+c8i.metal-96xl  —  2 sockets x 3 compute dies  =  6 NUMA domains
+
+  ┌───────────────── socket 0 ─────────────────┐  ┌───────────────── socket 1 ─────────────────┐
+  │  node 0     │  node 1     │  node 2        │  │  node 3     │  node 4     │  node 5        │
+  │  die 0      │  die 1      │  die 2         │  │  die 0      │  die 1      │  die 2         │
+  │  32 cores   │  32 cores   │  32 cores      │  │  32 cores   │  32 cores   │  32 cores      │
+  │  160MiB L3  │  160MiB L3  │  160MiB L3     │  │  160MiB L3  │  160MiB L3  │  160MiB L3     │
+  │  4 mem ch   │  4 mem ch   │  4 mem ch      │  │  4 mem ch   │  4 mem ch   │  4 mem ch      │
+  │  cpu 0-31   │  cpu 32-63  │  cpu 64-95     │  │  cpu 96-127 │  cpu128-159 │  cpu160-191    │
+  └─────────────┴─────────────┴────────────────┘  └─────────────┴─────────────┴────────────────┘
+         ▲                                  UPI
+         └── NIC attaches here (one die, one socket)
+```
+
+The plan reserves housekeeping and IRQ cores **per node**, so the node count directly sets the
+platform's overhead:
+
+```
+assuming 2 NUMA nodes (WRONG):   4 housekeeping +  4 irqnet  =   8 cores reserved
+actual SNC3, 6 NUMA nodes:      12 housekeeping + 12 irqnet  =  24 cores reserved
+```
+
+Three times the reservation. Worse, the wrong plan puts *no* housekeeping core in four of the
+six domains, so kernel per-node work on those dies has to run cross-domain or lands on an
+isolated core — which is precisely the jitter the design exists to remove.
+
+### The consequence nobody likes: NIC locality under SNC3
+
+The ENA adapter attaches to **one die on one socket**. Under SNC3 that means only ~32 of the
+192 cores on a `c8i.metal-96xl` are in the NIC's own NUMA domain. Cores on the other five
+domains pay a die crossing (nodes 1–2) or a UPI traversal (nodes 3–5) on every packet
+descriptor and DMA buffer touch.
+
+No amount of core isolation fixes an interconnect hop. So on `c8i`:
+
+- Put the latency-critical brokers on `EXCLUSIVE_CORES_NODE<nic_numa_node>` — that is the
+  real low-latency budget, and it is **23 cores, not 138**.
+- Treat the other five domains as capacity for work that is throughput-bound rather than
+  tail-latency-bound.
+- If you need more than one die's worth of latency-critical cores, shard the application by
+  NUMA domain and pin each shard to its own die, rather than letting one broker straddle dies.
+
+`lltune validate` fails if the running host's node count disagrees with the plan, and checks
+that every CPU the plan assigned to a node is actually resident on that node.
+
+### Why the AMD side is simpler
+
+Genoa and Turin run **NPS1** on EC2 — one NUMA node per socket — so a `c7a.metal-48xl` is two
+domains of 96 cores. The cache story is the opposite of Intel's, though: the L3 is per 8-core
+CCX, so a 96-core socket has 12 separate last-level caches inside one NUMA domain. That is
+what `l3_align` is for (§1), and it is why the AMD plans place the non-isolated block on whole
+CCX boundaries while the Intel plans mostly do not need to.
+
+**Verification status.** The SKU list, vCPU counts, CPU models and the Granite Rapids SNC3
+mode are from AWS and Intel documentation. The AMD NPS1 setting and Turin's 8-core CCX are
+*inferred* — NPS is a BIOS setting you cannot see from outside, and a 96-core Turin could in
+principle be Zen 5c with a 16-core CCX (the 4.5 GHz ceiling argues against it). Each profile
+records what is verified and what is assumed in its `confidence` block. On first contact with
+any of these shapes, run `lltune topology --live` and correct the profile.
+
+## 3. Boot layer — GRUB
 
 | Argument | Why |
 |---|---|
 | `nosmt=force` | A sibling thread competes for the same execution ports and L1/L2. Sharing a core is the largest single source of tail latency on a hyperthreaded box; it is not a scheduling problem you can tune around. Omitted automatically when the vendor already ships SMT off. |
-| `isolcpus=managed_irq,domain,<excl>` | `domain` removes the cores from every scheduler domain, so the load balancer never migrates a task onto them. `managed_irq` steers *kernel-managed* MSI-X vectors (ENA, NVMe) away from them — see §4, this flag is the only lever you have for those. |
+| `isolcpus=managed_irq,domain,<excl>` | `domain` removes the cores from every scheduler domain, so the load balancer never migrates a task onto them. `managed_irq` steers *kernel-managed* MSI-X vectors (ENA, NVMe) away from them — see §5, this flag is the only lever you have for those. |
 | `nohz_full=<excl>` | Stops the 1 kHz scheduler tick on cores running a single runnable task. Removes ~1 interrupt per millisecond per core. |
 | `rcu_nocbs=<excl>` | Moves RCU callback processing off the isolated cores onto `rcuo` kthreads on housekeeping. Without this, an isolated core still gets periodic multi-microsecond RCU work. |
 | `irqaffinity=<hk+irq>` | The initial default affinity for every non-managed interrupt, applied at boot before userspace exists. `apply-runtime.sh` re-asserts it, but this closes the window during boot. |
@@ -72,7 +160,7 @@ SMT already disabled) needs no special-casing.
   the MHz costs more than the residual variance. Set `LLTUNE_NO_TURBO=1` if you need a
   frequency-invariant timebase more than you need the clock speed.
 
-## 3. cgroup layer — why slices and not just `taskset`
+## 4. cgroup layer — why slices and not just `taskset`
 
 `isolcpus` removes the exclusive cores from init's affinity mask, and every process inherits
 that mask. So by default *nothing* can run on an isolated core, which is what you want — the
@@ -140,7 +228,7 @@ reboot. It is not the default here because it can be dismantled at runtime by an
 can write the cgroup tree, and because a boot-time guarantee is auditable in `/proc/cmdline`.
 Use it if you need to re-partition without rebooting, and accept the weaker guarantee.
 
-## 4. Interrupts — the part that actually goes wrong
+## 5. Interrupts — the part that actually goes wrong
 
 Three different mechanisms, and only one of them responds to `/proc/irq/N/smp_affinity`:
 
@@ -164,7 +252,7 @@ lets the NAPI poll drain the ring instead of taking a hard IRQ per burst; RPS is
 it costs an IPI per packet; XPS maps each exclusive core to a fixed TX queue so a transmit
 never contends on a queue lock owned by another socket.
 
-## 5. Sizing
+## 6. Sizing
 
 Defaults per NUMA node: housekeeping `max(2, 4%)` capped at 6, irqnet `max(2, 5%)` capped at
 12, shared 15%, rest exclusive. On `c7a-48xl` that is 8 housekeeping / 10 irqnet / 30 shared
@@ -176,16 +264,30 @@ a dozen cores on a 384-vCPU box. `min_exclusive_ratio` is the backstop: if a pol
 would leave less than 55% of the machine exclusive, the planner refuses rather than emitting
 a plan nobody reviewed.
 
-### The dual-socket caveat
+### Node count drives the overhead
 
-On the `48xl` and `96xl` dual-socket shapes the NIC sits on one socket. Cores on the far
-socket are an interconnect hop away, and no amount of core isolation fixes a traversal.
-Treat the NIC-local socket as the low-latency real estate and the far socket as capacity —
-pin the latency-critical brokers to `EXCLUSIVE_CORES_NODE<nic_numa_node>` and put bulk work
-everywhere else. `c8a-96xl` is the sharpest case: 288 exclusive cores, but only half of them
-are one hop from the NIC.
+Because housekeeping and IRQ cores are reserved **per NUMA node**, the platform's fixed cost
+scales with the node count, not the core count:
 
-## 6. What this cannot fix
+| Shape | NUMA nodes | Cores/node | housekeeping | irqnet | shared | exclusive |
+|---|---|---|---|---|---|---|
+| `c7i-24xl` | 1 | 48 | 2 | 2 | 7 | 37 |
+| `c7i-48xl` | 2 | 48 | 4 | 4 | 14 | 74 |
+| `c8i-48xl` | 3 | 32 | 6 | 6 | 15 | 69 |
+| `c8i-96xl` | 6 | 32 | 12 | 12 | 30 | 138 |
+| `c7a-48xl` | 2 | 96 | 8 | 10 | 30 | 144 |
+| `c8a-24xl` | 1 | 96 | 4 | 5 | 15 | 72 |
+| `c8a-48xl` | 2 | 96 | 8 | 10 | 30 | 144 |
+
+`c8i-96xl` is the shape where this bites: 24 cores go to the platform purely because SNC3
+splits the machine into six domains, each of which needs its own housekeeping and IRQ cores.
+That is the correct answer, not waste — a domain with no local housekeeping core forces its
+per-node kernel work cross-domain — but it is worth seeing before someone asks why the
+384 vCPU box yields 138 exclusive cores while the 192 vCPU `c7a` yields 144.
+
+See §2 for the NIC-locality consequence, which is the sharper constraint on `c8i`.
+
+## 7. What this cannot fix
 
 Isolation removes *your* jitter. It does not remove the hypervisor's, the firmware's, or the
 network's. On EC2 metal there is no hypervisor underneath you, but SMIs still exist — that

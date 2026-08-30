@@ -1,13 +1,19 @@
 {
   "name": "c8a-24xl",
-  "description": "c8a 24xl - AMD EPYC 9005 (Turin), single socket. SMT disabled.",
+  "description": "c8a.metal-24xl - AMD EPYC 5th gen (Turin), single socket. SMT disabled by AWS.",
   "vendor": "amd",
-  "metal_sku": "c8a.24xlarge (VM size)",
+  "metal_sku": "c8a.metal-24xl",
   "vcpus": 96,
   "sockets": 1,
   "cores_per_socket": 96,
   "threads_per_core": 1,
   "numa_nodes": 1,
   "cores_per_l3": 8,
-  "nic_numa_node": 0
+  "nic_numa_node": 0,
+  "numa_mode": "NPS1 - 1 NUMA node per socket",
+  "confidence": {
+    "sku_and_vcpus": "verified - AWS c8a instance page",
+    "cores_per_l3": "ASSUMED classic Zen 5 (8-core CCX). The 4.5 GHz max frequency points to classic rather than Zen 5c dense, which would be 16. Confirm with --live: it moves where the exclusive block starts.",
+    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'."
+  }
 }

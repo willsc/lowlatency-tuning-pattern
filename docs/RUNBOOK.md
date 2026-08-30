@@ -2,30 +2,57 @@
 
 ## Apply to a new host
 
+`scripts/apply.sh` is the front door. Run it with no arguments first: it plans from the
+host's real topology and prints every file it would write, diffed against what is already
+there, without touching anything.
+
 ```sh
 git clone <this repo> /opt/lowlatency-tuning-pattern
 cd /opt/lowlatency-tuning-pattern
 
-sudo ./scripts/install.sh --live          # prints the plan, then installs all three layers
-# review the core map it prints before rebooting
+./scripts/apply.sh                        # DRY RUN - writes nothing, needs no root
+sudo ./scripts/apply.sh --apply           # same plan, actually installed (asks first)
 sudo reboot
 
 ./bin/lltune validate                     # must be 0 failed
 sudo ./scripts/jitter-test.sh 300         # acceptance gate
 ```
 
-`install.sh` is idempotent. Re-running it re-plans, re-renders and re-installs; only the
-boot layer needs the reboot.
+The dry run and the apply use the **same** plan: `--apply` hands the plan it just showed
+you to `install.sh` rather than recomputing one, so the host cannot get something other
+than what you reviewed.
+
+What the dry run shows, layer by layer:
+
+| Section | What you are checking |
+|---|---|
+| `PLAN` | the core map: how many cores each role gets, on which NUMA node |
+| `LAYER 1` | the GRUB file diff, then which planned arguments are missing from `/proc/cmdline` — this is what decides whether a reboot is required |
+| `LAYER 2` | the six unit files diffed, then the planned cpusets against the **live** ones in `/sys/fs/cgroup` |
+| `LAYER 3` | every runtime write `apply-runtime.sh` would make, with per-CPU paths collapsed |
+| `LAYER 4` | `cores.env`, `plan.json` and the sysctl file diffed |
+| `SUMMARY` | counts, and whether a reboot is needed |
 
 ### Variants
 
 ```sh
-sudo ./scripts/install.sh --live --no-boot                 # cgroups + runtime only, no reboot
-sudo ./scripts/install.sh --profile c7a-48xl               # bake into an AMI, no live host needed
-sudo ./scripts/install.sh --live --shared-ratio 0.20       # bigger shared pool
-sudo ./scripts/install.sh --live --hugepages-1g-per-node 32
-sudo ./scripts/install.sh --live --mitigations-off         # read docs/DESIGN.md §2 first
+./scripts/apply.sh --profile c7a-48xl     # dry-run a shape you are not logged into
+./scripts/apply.sh --brief                # statuses only, no diffs
+./scripts/apply.sh --full                 # never truncate a diff
+
+sudo ./scripts/apply.sh --apply --no-boot                 # cgroups + runtime only, no reboot
+sudo ./scripts/apply.sh --apply --yes                     # skip the confirmation prompt
+sudo ./scripts/apply.sh --apply --shared-ratio 0.20       # bigger shared pool
+sudo ./scripts/apply.sh --apply --hugepages-1g-per-node 32
+sudo ./scripts/apply.sh --apply --mitigations-off         # read docs/DESIGN.md §3 first
 ```
+
+`--apply` refuses to run without a TTY unless you pass `--yes`, so a CI job or an
+Ansible task has to opt in explicitly rather than doing it by accident.
+
+`scripts/install.sh` is still there and does the actual writing; call it directly only if
+you want the install without the review step. Both are idempotent — re-running re-plans,
+re-renders and re-installs, and only the boot layer needs the reboot.
 
 ## Change the core split on a running fleet
 
@@ -33,7 +60,8 @@ Changing `shared_ratio` moves the boundary between shared and exclusive, which c
 `isolcpus` — so it is a **reboot**, not a live change.
 
 ```sh
-sudo ./scripts/install.sh --live --shared-ratio 0.20
+./scripts/apply.sh --shared-ratio 0.20         # see exactly which cores move first
+sudo ./scripts/apply.sh --apply --shared-ratio 0.20
 # drain the node, then:
 sudo reboot
 ./bin/lltune validate
@@ -164,6 +192,31 @@ To run an ad-hoc command on the isolated set (SSH sessions are confined to house
 ```sh
 sudo systemd-run --slice=pulsar.slice -t /bin/bash
 ```
+
+## Confirming NUMA topology on first contact
+
+The profiles record which fields are verified and which are inferred (`confidence` block in
+each `profiles/*.json`). Granite Rapids runs **SNC3**, so a `c8i.metal-96xl` is six NUMA
+nodes, not two — see `docs/DESIGN.md` §2. The AMD NPS setting and Turin's CCX size are
+inferred and should be confirmed the first time you touch one of those shapes:
+
+```sh
+lscpu | grep -E 'Socket|NUMA|Thread|Model name'
+numactl --hardware
+lscpu -e=CPU,NODE,SOCKET,CORE,L3        # the L3 column shows CCX / compute-die boundaries
+```
+
+Then check the profile agrees with reality:
+
+```sh
+diff <(./bin/lltune topology --profile c8i-96xl) <(./bin/lltune topology --live)
+```
+
+`lltune validate` also fails outright if the running host's NUMA node count disagrees with
+the installed plan, and checks that every CPU the plan assigned to a node is resident there.
+A plan built on the wrong node count looks perfectly plausible — the ranges are contiguous
+and the counts add up — so this check is the thing standing between you and a silently wrong
+partition.
 
 ## Adding a new instance shape
 

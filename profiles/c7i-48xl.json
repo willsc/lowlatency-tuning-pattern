@@ -1,6 +1,6 @@
 {
   "name": "c7i-48xl",
-  "description": "c7i.metal-48xl - Intel Sapphire Rapids, dual socket",
+  "description": "c7i.metal-48xl - custom Intel Sapphire Rapids, dual socket",
   "vendor": "intel",
   "metal_sku": "c7i.metal-48xl",
   "vcpus": 192,
@@ -9,5 +9,11 @@
   "threads_per_core": 2,
   "numa_nodes": 2,
   "cores_per_l3": 48,
-  "nic_numa_node": 0
+  "nic_numa_node": 0,
+  "numa_mode": "SNC disabled - 1 NUMA node per socket",
+  "confidence": {
+    "sku_and_vcpus": "verified - AWS c7i instance page",
+    "sockets_and_cores": "derived from vCPU count and SMT2",
+    "numa_nodes": "ASSUMED. Confirm with 'lltune topology --live'."
+  }
 }

@@ -1,0 +1,1061 @@
+# Configuration reference — boot isolation and cgroup slices
+
+> **Generated** by `scripts/build-config-reference.py` on 2026-08-30. Do not hand-edit:
+> every list below is rendered from the planner, so it is byte-for-byte what
+> `scripts/install.sh` writes to disk for that shape. Regenerate after any change to
+> `profiles/policy.json` or a profile.
+
+This document covers the two layers that need a file on disk:
+
+| Layer | File | When it takes effect |
+|---|---|---|
+| **1 — boot isolation** | `/etc/default/grub.d/99-lowlatency.cfg` | at boot; **requires a reboot** |
+| **2 — cgroup v2 slices** | `/etc/systemd/system/` | `systemctl daemon-reload`; immediate |
+
+Layers 3 (runtime IRQ/queue pinning) and 4 (the application's `cores.env` contract) are
+not files you edit — see `docs/layers.html` or `lltune layers --profile <name>`.
+
+The two layers are not independent. `pulsar.slice`'s `AllowedCPUs` **is** the `isolcpus`
+set, and both are rendered from the same `plan.json` field. A cgroup that let a thread
+onto a core the kernel had not isolated, or isolated a core no cgroup could reach, is
+the exact class of bug this repo is built to make impossible.
+
+## Contents
+
+- [Summary: the isolation set for every shape](#summary-the-isolation-set-for-every-shape)
+- [Part 1 — Boot isolation (GRUB)](#part-1--boot-isolation-grub)
+  - [1.1 Arguments identical on every shape](#11-arguments-identical-on-every-shape)
+  - [1.2 Arguments that vary by shape](#12-arguments-that-vary-by-shape)
+  - [1.3 The installed file, per shape](#13-the-installed-file-per-shape)
+- [Part 2 — cgroup v2 slices](#part-2--cgroup-v2-slices)
+  - [2.1 The slice map](#21-the-slice-map)
+  - [2.2 AllowedCPUs for every shape](#22-allowedcpus-for-every-shape)
+  - [2.3 The installed unit files, per shape](#23-the-installed-unit-files-per-shape)
+- [Part 3 — Invariants that tie the two layers together](#part-3--invariants-that-tie-the-two-layers-together)
+
+## Summary: the isolation set for every shape
+
+`isolcpus` carries the exclusive cores; `irqaffinity` carries everything that is left
+after them, minus the shared pool — housekeeping plus irqnet. Housekeeping and IRQ cores
+are reserved **per NUMA node**, which is why node count, not core count, drives the
+platform's overhead.
+
+| Profile | Metal SKU | NUMA | Cores | `isolcpus` (exclusive) | # | `irqaffinity` (housekeeping + irqnet) | # |
+|---|---|---:|---:|---|---:|---|---:|
+| `c7i-24xl` | `c7i.metal-24xl` | 1 | 48 | `11-47` | 37 | `0-3` | 4 |
+| `c7i-48xl` | `c7i.metal-48xl` | 2 | 96 | `11-47,59-95` | 74 | `0-3,48-51` | 8 |
+| `c8i-48xl` | `c8i.metal-48xl` | 3 | 96 | `9-31,41-63,73-95` | 69 | `0-3,32-35,64-67` | 12 |
+| `c8i-96xl` | `c8i.metal-96xl` | 6 | 192 | `9-31,41-63,73-95,105-127,137-159,169-191` | 138 | `0-3,32-35,64-67,96-99,128-131,160-163` | 24 |
+| `c7a-48xl` | `c7a.metal-48xl` | 2 | 192 | `24-95,120-191` | 144 | `0-8,96-104` | 18 |
+| `c8a-24xl` | `c8a.metal-24xl` | 1 | 96 | `24-95` | 72 | `0-8` | 9 |
+| `c8a-48xl` | `c8a.metal-48xl` | 2 | 192 | `24-95,120-191` | 144 | `0-8,96-104` | 18 |
+
+## Part 1 — Boot isolation (GRUB)
+
+`scripts/install.sh` writes `/etc/default/grub.d/99-lowlatency.cfg` and re-runs `update-grub` / `grub2-mkconfig`.
+On AL2023 and RHEL, which have no `grub.d`, it patches `/etc/default/grub` in place after
+taking a timestamped backup, replacing any previous lltune block rather than appending a
+second one.
+
+### 1.1 Arguments identical on every shape
+
+These carry no CPU list, so they are the same string on all seven profiles.
+
+**Isolation**
+
+| Argument | Why |
+|---|---|
+| `nohz=on` | Enable the dynamic tick |
+
+**Scheduler and NUMA**
+
+| Argument | Why |
+|---|---|
+| `numa_balancing=disable` | Off - automatic balancing unmaps pages to sample them, and the fault stalls |
+| `skew_tick=1` | De-synchronise per-CPU ticks so cores don't contend on the same locks |
+
+**Timers, watchdogs, noise**
+
+| Argument | Why |
+|---|---|
+| `nmi_watchdog=0` | Stop periodic NMI sampling |
+| `nosoftlockup` | Stop the soft-lockup detector |
+| `mce=ignore_ce` | Ignore corrected machine checks rather than handling a storm |
+| `tsc=reliable` | Trust the TSC; skip the watchdog that can demote the clocksource |
+| `clocksource=tsc` | Pin the clocksource - a mid-flight demotion to HPET makes every clock read a syscall |
+| `audit=0` | Disable the audit subsystem |
+| `rcupdate.rcu_normal_after_boot=1` | Use normal, non-expedited RCU once boot is done |
+
+**Power and frequency**
+
+| Argument | Why |
+|---|---|
+| `processor.max_cstate=1` | Cap the ACPI C-state - C6 exit latency is tens of microseconds |
+| `cpufreq.default_governor=performance` | Set the governor before any workload starts |
+
+**Memory**
+
+| Argument | Why |
+|---|---|
+| `transparent_hugepage=never` | Never - THP defrag stalls are milliseconds long |
+
+**PCIe and IOMMU**
+
+| Argument | Why |
+|---|---|
+| `pcie_aspm=off` | No PCIe link power states - exit latency lands on the first packet after idle |
+| `iommu=pt` | Passthrough - no DMA translation on the data path |
+
+**cgroup v2**
+
+| Argument | Why |
+|---|---|
+| `systemd.unified_cgroup_hierarchy=1` | Required for the cpuset controller the slice layer uses |
+| `cgroup_no_v1=all` | Disable the v1 controllers |
+
+### 1.2 Arguments that vary by shape
+
+4 arguments carry a CPU list (`isolcpus`, `nohz_full`, `rcu_nocbs`, `irqaffinity`) and 2 are conditional on the silicon (`nosmt`, `intel_idle.max_cstate`). Everything in 1.1 is constant. This is the whole of what changes between shapes at the boot layer.
+
+**`nosmt`** — Disable SMT - a sibling thread contends for the same execution ports and L1/L2
+
+| Profile | Value |
+|---|---|
+| `c7i-24xl` | `nosmt=force` |
+| `c7i-48xl` | `nosmt=force` |
+| `c8i-48xl` | `nosmt=force` |
+| `c8i-96xl` | `nosmt=force` |
+| `c7a-48xl` | — _SMT already off on this AMD shape_ |
+| `c8a-24xl` | — _SMT already off on this AMD shape_ |
+| `c8a-48xl` | — _SMT already off on this AMD shape_ |
+
+**`isolcpus`** — Remove these cores from every scheduler domain; steer managed IRQs away
+
+| Profile | Value |
+|---|---|
+| `c7i-24xl` | `isolcpus=managed_irq,domain,11-47` |
+| `c7i-48xl` | `isolcpus=managed_irq,domain,11-47,59-95` |
+| `c8i-48xl` | `isolcpus=managed_irq,domain,9-31,41-63,73-95` |
+| `c8i-96xl` | `isolcpus=managed_irq,domain,9-31,41-63,73-95,105-127,137-159,169-191` |
+| `c7a-48xl` | `isolcpus=managed_irq,domain,24-95,120-191` |
+| `c8a-24xl` | `isolcpus=managed_irq,domain,24-95` |
+| `c8a-48xl` | `isolcpus=managed_irq,domain,24-95,120-191` |
+
+**`nohz_full`** — Stop the 1 kHz tick on cores running a single runnable task
+
+| Profile | Value |
+|---|---|
+| `c7i-24xl` | `nohz_full=11-47` |
+| `c7i-48xl` | `nohz_full=11-47,59-95` |
+| `c8i-48xl` | `nohz_full=9-31,41-63,73-95` |
+| `c8i-96xl` | `nohz_full=9-31,41-63,73-95,105-127,137-159,169-191` |
+| `c7a-48xl` | `nohz_full=24-95,120-191` |
+| `c8a-24xl` | `nohz_full=24-95` |
+| `c8a-48xl` | `nohz_full=24-95,120-191` |
+
+**`rcu_nocbs`** — Move RCU callback processing onto housekeeping cores
+
+| Profile | Value |
+|---|---|
+| `c7i-24xl` | `rcu_nocbs=11-47` |
+| `c7i-48xl` | `rcu_nocbs=11-47,59-95` |
+| `c8i-48xl` | `rcu_nocbs=9-31,41-63,73-95` |
+| `c8i-96xl` | `rcu_nocbs=9-31,41-63,73-95,105-127,137-159,169-191` |
+| `c7a-48xl` | `rcu_nocbs=24-95,120-191` |
+| `c8a-24xl` | `rcu_nocbs=24-95` |
+| `c8a-48xl` | `rcu_nocbs=24-95,120-191` |
+
+**`irqaffinity`** — Boot-time default affinity for every non-managed interrupt
+
+| Profile | Value |
+|---|---|
+| `c7i-24xl` | `irqaffinity=0-3` |
+| `c7i-48xl` | `irqaffinity=0-3,48-51` |
+| `c8i-48xl` | `irqaffinity=0-3,32-35,64-67` |
+| `c8i-96xl` | `irqaffinity=0-3,32-35,64-67,96-99,128-131,160-163` |
+| `c7a-48xl` | `irqaffinity=0-8,96-104` |
+| `c8a-24xl` | `irqaffinity=0-8` |
+| `c8a-48xl` | `irqaffinity=0-8,96-104` |
+
+**`intel_idle.max_cstate`** — Cap intel_idle at C1
+
+| Profile | Value |
+|---|---|
+| `c7i-24xl` | `intel_idle.max_cstate=1` |
+| `c7i-48xl` | `intel_idle.max_cstate=1` |
+| `c8i-48xl` | `intel_idle.max_cstate=1` |
+| `c8i-96xl` | `intel_idle.max_cstate=1` |
+| `c7a-48xl` | — _AMD shape — `intel_idle` is not the idle driver_ |
+| `c8a-24xl` | — _AMD shape — `intel_idle` is not the idle driver_ |
+| `c8a-48xl` | — _AMD shape — `intel_idle` is not the idle driver_ |
+
+### 1.3 The installed file, per shape
+
+Verbatim contents of `/etc/default/grub.d/99-lowlatency.cfg`. The cmdline is one line; it is shown wrapped by your
+viewer, not by the file.
+
+#### `c7i-24xl`
+
+c7i.metal-24xl · Intel Sapphire Rapids · 1 socket × 48 cores · 1 NUMA node (SNC disabled) · L3 domain 48 cores · SMT 2 → disabled at boot
+
+```sh
+# Managed by lltune. Regenerate with: lltune render
+# Do not hand-edit; edit profiles/policy.json and re-render.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nosmt=force isolcpus=managed_irq,domain,11-47 nohz_full=11-47 rcu_nocbs=11-47 irqaffinity=0-3 nohz=on numa_balancing=disable skew_tick=1 nmi_watchdog=0 nosoftlockup mce=ignore_ce tsc=reliable clocksource=tsc audit=0 rcupdate.rcu_normal_after_boot=1 processor.max_cstate=1 intel_idle.max_cstate=1 cpufreq.default_governor=performance transparent_hugepage=never pcie_aspm=off iommu=pt systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+```
+
+<details><summary>Same cmdline, one argument per line</summary>
+
+```
+nosmt=force
+isolcpus=managed_irq,domain,11-47
+nohz_full=11-47
+rcu_nocbs=11-47
+irqaffinity=0-3
+nohz=on
+numa_balancing=disable
+skew_tick=1
+nmi_watchdog=0
+nosoftlockup
+mce=ignore_ce
+tsc=reliable
+clocksource=tsc
+audit=0
+rcupdate.rcu_normal_after_boot=1
+processor.max_cstate=1
+intel_idle.max_cstate=1
+cpufreq.default_governor=performance
+transparent_hugepage=never
+pcie_aspm=off
+iommu=pt
+systemd.unified_cgroup_hierarchy=1
+cgroup_no_v1=all
+```
+</details>
+
+#### `c7i-48xl`
+
+c7i.metal-48xl · Intel Sapphire Rapids · 2 sockets × 48 cores · 2 NUMA nodes (SNC disabled) · L3 domain 48 cores · SMT 2 → disabled at boot
+
+```sh
+# Managed by lltune. Regenerate with: lltune render
+# Do not hand-edit; edit profiles/policy.json and re-render.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nosmt=force isolcpus=managed_irq,domain,11-47,59-95 nohz_full=11-47,59-95 rcu_nocbs=11-47,59-95 irqaffinity=0-3,48-51 nohz=on numa_balancing=disable skew_tick=1 nmi_watchdog=0 nosoftlockup mce=ignore_ce tsc=reliable clocksource=tsc audit=0 rcupdate.rcu_normal_after_boot=1 processor.max_cstate=1 intel_idle.max_cstate=1 cpufreq.default_governor=performance transparent_hugepage=never pcie_aspm=off iommu=pt systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+```
+
+<details><summary>Same cmdline, one argument per line</summary>
+
+```
+nosmt=force
+isolcpus=managed_irq,domain,11-47,59-95
+nohz_full=11-47,59-95
+rcu_nocbs=11-47,59-95
+irqaffinity=0-3,48-51
+nohz=on
+numa_balancing=disable
+skew_tick=1
+nmi_watchdog=0
+nosoftlockup
+mce=ignore_ce
+tsc=reliable
+clocksource=tsc
+audit=0
+rcupdate.rcu_normal_after_boot=1
+processor.max_cstate=1
+intel_idle.max_cstate=1
+cpufreq.default_governor=performance
+transparent_hugepage=never
+pcie_aspm=off
+iommu=pt
+systemd.unified_cgroup_hierarchy=1
+cgroup_no_v1=all
+```
+</details>
+
+#### `c8i-48xl`
+
+c8i.metal-48xl · Intel Xeon 6 (Granite Rapids) · 1 socket × 96 cores · 3 NUMA nodes (SNC3) · L3 domain 32 cores · SMT 2 → disabled at boot
+
+```sh
+# Managed by lltune. Regenerate with: lltune render
+# Do not hand-edit; edit profiles/policy.json and re-render.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nosmt=force isolcpus=managed_irq,domain,9-31,41-63,73-95 nohz_full=9-31,41-63,73-95 rcu_nocbs=9-31,41-63,73-95 irqaffinity=0-3,32-35,64-67 nohz=on numa_balancing=disable skew_tick=1 nmi_watchdog=0 nosoftlockup mce=ignore_ce tsc=reliable clocksource=tsc audit=0 rcupdate.rcu_normal_after_boot=1 processor.max_cstate=1 intel_idle.max_cstate=1 cpufreq.default_governor=performance transparent_hugepage=never pcie_aspm=off iommu=pt systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+```
+
+<details><summary>Same cmdline, one argument per line</summary>
+
+```
+nosmt=force
+isolcpus=managed_irq,domain,9-31,41-63,73-95
+nohz_full=9-31,41-63,73-95
+rcu_nocbs=9-31,41-63,73-95
+irqaffinity=0-3,32-35,64-67
+nohz=on
+numa_balancing=disable
+skew_tick=1
+nmi_watchdog=0
+nosoftlockup
+mce=ignore_ce
+tsc=reliable
+clocksource=tsc
+audit=0
+rcupdate.rcu_normal_after_boot=1
+processor.max_cstate=1
+intel_idle.max_cstate=1
+cpufreq.default_governor=performance
+transparent_hugepage=never
+pcie_aspm=off
+iommu=pt
+systemd.unified_cgroup_hierarchy=1
+cgroup_no_v1=all
+```
+</details>
+
+#### `c8i-96xl`
+
+c8i.metal-96xl · Intel Xeon 6975P-C · 2 sockets × 96 cores · 6 NUMA nodes (SNC3) · L3 domain 32 cores · SMT 2 → disabled at boot
+
+```sh
+# Managed by lltune. Regenerate with: lltune render
+# Do not hand-edit; edit profiles/policy.json and re-render.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nosmt=force isolcpus=managed_irq,domain,9-31,41-63,73-95,105-127,137-159,169-191 nohz_full=9-31,41-63,73-95,105-127,137-159,169-191 rcu_nocbs=9-31,41-63,73-95,105-127,137-159,169-191 irqaffinity=0-3,32-35,64-67,96-99,128-131,160-163 nohz=on numa_balancing=disable skew_tick=1 nmi_watchdog=0 nosoftlockup mce=ignore_ce tsc=reliable clocksource=tsc audit=0 rcupdate.rcu_normal_after_boot=1 processor.max_cstate=1 intel_idle.max_cstate=1 cpufreq.default_governor=performance transparent_hugepage=never pcie_aspm=off iommu=pt systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+```
+
+<details><summary>Same cmdline, one argument per line</summary>
+
+```
+nosmt=force
+isolcpus=managed_irq,domain,9-31,41-63,73-95,105-127,137-159,169-191
+nohz_full=9-31,41-63,73-95,105-127,137-159,169-191
+rcu_nocbs=9-31,41-63,73-95,105-127,137-159,169-191
+irqaffinity=0-3,32-35,64-67,96-99,128-131,160-163
+nohz=on
+numa_balancing=disable
+skew_tick=1
+nmi_watchdog=0
+nosoftlockup
+mce=ignore_ce
+tsc=reliable
+clocksource=tsc
+audit=0
+rcupdate.rcu_normal_after_boot=1
+processor.max_cstate=1
+intel_idle.max_cstate=1
+cpufreq.default_governor=performance
+transparent_hugepage=never
+pcie_aspm=off
+iommu=pt
+systemd.unified_cgroup_hierarchy=1
+cgroup_no_v1=all
+```
+</details>
+
+#### `c7a-48xl`
+
+c7a.metal-48xl · AMD EPYC 9R14 (Genoa) · 2 sockets × 96 cores · 2 NUMA nodes (NPS1) · L3 domain 8 cores · SMT already off (AWS)
+
+```sh
+# Managed by lltune. Regenerate with: lltune render
+# Do not hand-edit; edit profiles/policy.json and re-render.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,24-95,120-191 nohz_full=24-95,120-191 rcu_nocbs=24-95,120-191 irqaffinity=0-8,96-104 nohz=on numa_balancing=disable skew_tick=1 nmi_watchdog=0 nosoftlockup mce=ignore_ce tsc=reliable clocksource=tsc audit=0 rcupdate.rcu_normal_after_boot=1 processor.max_cstate=1 cpufreq.default_governor=performance transparent_hugepage=never pcie_aspm=off iommu=pt systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+```
+
+<details><summary>Same cmdline, one argument per line</summary>
+
+```
+isolcpus=managed_irq,domain,24-95,120-191
+nohz_full=24-95,120-191
+rcu_nocbs=24-95,120-191
+irqaffinity=0-8,96-104
+nohz=on
+numa_balancing=disable
+skew_tick=1
+nmi_watchdog=0
+nosoftlockup
+mce=ignore_ce
+tsc=reliable
+clocksource=tsc
+audit=0
+rcupdate.rcu_normal_after_boot=1
+processor.max_cstate=1
+cpufreq.default_governor=performance
+transparent_hugepage=never
+pcie_aspm=off
+iommu=pt
+systemd.unified_cgroup_hierarchy=1
+cgroup_no_v1=all
+```
+</details>
+
+#### `c8a-24xl`
+
+c8a.metal-24xl · AMD EPYC Turin · 1 socket × 96 cores · 1 NUMA node (NPS1) · L3 domain 8 cores · SMT already off (AWS)
+
+```sh
+# Managed by lltune. Regenerate with: lltune render
+# Do not hand-edit; edit profiles/policy.json and re-render.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,24-95 nohz_full=24-95 rcu_nocbs=24-95 irqaffinity=0-8 nohz=on numa_balancing=disable skew_tick=1 nmi_watchdog=0 nosoftlockup mce=ignore_ce tsc=reliable clocksource=tsc audit=0 rcupdate.rcu_normal_after_boot=1 processor.max_cstate=1 cpufreq.default_governor=performance transparent_hugepage=never pcie_aspm=off iommu=pt systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+```
+
+<details><summary>Same cmdline, one argument per line</summary>
+
+```
+isolcpus=managed_irq,domain,24-95
+nohz_full=24-95
+rcu_nocbs=24-95
+irqaffinity=0-8
+nohz=on
+numa_balancing=disable
+skew_tick=1
+nmi_watchdog=0
+nosoftlockup
+mce=ignore_ce
+tsc=reliable
+clocksource=tsc
+audit=0
+rcupdate.rcu_normal_after_boot=1
+processor.max_cstate=1
+cpufreq.default_governor=performance
+transparent_hugepage=never
+pcie_aspm=off
+iommu=pt
+systemd.unified_cgroup_hierarchy=1
+cgroup_no_v1=all
+```
+</details>
+
+#### `c8a-48xl`
+
+c8a.metal-48xl · AMD EPYC Turin · 2 sockets × 96 cores · 2 NUMA nodes (NPS1) · L3 domain 8 cores · SMT already off (AWS)
+
+```sh
+# Managed by lltune. Regenerate with: lltune render
+# Do not hand-edit; edit profiles/policy.json and re-render.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=managed_irq,domain,24-95,120-191 nohz_full=24-95,120-191 rcu_nocbs=24-95,120-191 irqaffinity=0-8,96-104 nohz=on numa_balancing=disable skew_tick=1 nmi_watchdog=0 nosoftlockup mce=ignore_ce tsc=reliable clocksource=tsc audit=0 rcupdate.rcu_normal_after_boot=1 processor.max_cstate=1 cpufreq.default_governor=performance transparent_hugepage=never pcie_aspm=off iommu=pt systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+```
+
+<details><summary>Same cmdline, one argument per line</summary>
+
+```
+isolcpus=managed_irq,domain,24-95,120-191
+nohz_full=24-95,120-191
+rcu_nocbs=24-95,120-191
+irqaffinity=0-8,96-104
+nohz=on
+numa_balancing=disable
+skew_tick=1
+nmi_watchdog=0
+nosoftlockup
+mce=ignore_ce
+tsc=reliable
+clocksource=tsc
+audit=0
+rcupdate.rcu_normal_after_boot=1
+processor.max_cstate=1
+cpufreq.default_governor=performance
+transparent_hugepage=never
+pcie_aspm=off
+iommu=pt
+systemd.unified_cgroup_hierarchy=1
+cgroup_no_v1=all
+```
+</details>
+
+## Part 2 — cgroup v2 slices
+
+6 unit files: 2 new slices (`irqnet.slice`, `pulsar.slice`), and 4 drop-ins that narrow units systemd already ships (`system.slice`, `user.slice`, `machine.slice`, `init.scope`). Drop-ins are used rather than full replacements so a distribution update to the underlying unit is not lost.
+
+`cgroup v2` is required — `AllowedCPUs` is a v2-only property, which is why
+`systemd.unified_cgroup_hierarchy=1` and `cgroup_no_v1=all` are on the cmdline in Part 1.
+
+### 2.1 The slice map
+
+| Unit | Holds | Isolated | What runs there |
+|---|---|---|---|
+| `system.slice` | housekeeping + shared_cores | no | Ordinary services, plus the application's shared pool: GC, JIT, admin endpoints, compaction. |
+| `user.slice` | housekeeping | no | Login sessions. Kept off the shared pool so an ssh session cannot land on an application core. |
+| `machine.slice` | housekeeping | no | Containers and VMs, for the same reason. |
+| `init.scope` | housekeeping | no | PID 1 itself. |
+| `irqnet.slice` | irqnet | no | NIC and NVMe interrupt handling, softirq, irqbalance. |
+| `pulsar.slice` | exclusive_cores | **yes** | The latency path. This cpuset exists because `isolcpus` is a real kernel guarantee worth gating access to. |
+
+Every core on the box belongs to exactly one of `system.slice`, `irqnet.slice` and
+`pulsar.slice`; `scripts/selftest.py` asserts that partition holds for every profile.
+`user.slice`, `machine.slice` and `init.scope` are subsets of the housekeeping set, not
+extra partitions.
+
+### 2.2 AllowedCPUs for every shape
+
+`user.slice`, `machine.slice`, `init.scope` are rendered identically — all three get the housekeeping set —
+so they share one column.
+
+| Profile | `system.slice` | `user.slice`, `machine.slice`, `init.scope` | `irqnet.slice` | `pulsar.slice` |
+|---|---|---|---|---|
+| `c7i-24xl` | `0-1,4-10` | `0-1` | `2-3` | `11-47` |
+| `c7i-48xl` | `0-1,4-10,48-49,52-58` | `0-1,48-49` | `2-3,50-51` | `11-47,59-95` |
+| `c8i-48xl` | `0-1,4-8,32-33,36-40,64-65,68-72` | `0-1,32-33,64-65` | `2-3,34-35,66-67` | `9-31,41-63,73-95` |
+| `c8i-96xl` | `0-1,4-8,32-33,36-40,64-65,68-72,96-97,100-104,128-129,132-136,160-161,164-168` | `0-1,32-33,64-65,96-97,128-129,160-161` | `2-3,34-35,66-67,98-99,130-131,162-163` | `9-31,41-63,73-95,105-127,137-159,169-191` |
+| `c7a-48xl` | `0-3,9-23,96-99,105-119` | `0-3,96-99` | `4-8,100-104` | `24-95,120-191` |
+| `c8a-24xl` | `0-3,9-23` | `0-3` | `4-8` | `24-95` |
+| `c8a-48xl` | `0-3,9-23,96-99,105-119` | `0-3,96-99` | `4-8,100-104` | `24-95,120-191` |
+
+| Profile | `system.slice` | housekeeping-only | `irqnet.slice` | `pulsar.slice` | total |
+|---|---:|---:|---:|---:|---:|
+| `c7i-24xl` | 9 | 2 | 2 | 37 | 48 |
+| `c7i-48xl` | 18 | 4 | 4 | 74 | 96 |
+| `c8i-48xl` | 21 | 6 | 6 | 69 | 96 |
+| `c8i-96xl` | 42 | 12 | 12 | 138 | 192 |
+| `c7a-48xl` | 38 | 8 | 10 | 144 | 192 |
+| `c8a-24xl` | 19 | 4 | 5 | 72 | 96 |
+| `c8a-48xl` | 38 | 8 | 10 | 144 | 192 |
+
+_Counts are CPUs, and the three partition columns sum to the total: housekeeping-only is
+a subset of `system.slice`, not an addition to it._
+
+### 2.3 The installed unit files, per shape
+
+Verbatim contents, at the path `scripts/install.sh` writes them to.
+
+#### `c7i-24xl`
+
+c7i.metal-24xl · Intel Sapphire Rapids · 1 socket × 48 cores · 1 NUMA node (SNC disabled) · L3 domain 48 cores · SMT 2 → disabled at boot
+
+**`/etc/systemd/system/system.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+# housekeeping = 0-1
+# shared_cores = 4-10
+AllowedCPUs=0-1,4-10
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/user.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/machine.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/init.scope.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Scope]
+AllowedCPUs=0-1
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/irqnet.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=IRQ handling, softirq and NIC housekeeping
+Before=slices.target
+
+[Slice]
+AllowedCPUs=2-3
+AllowedMemoryNodes=0
+CPUAccounting=yes
+```
+
+**`/etc/systemd/system/pulsar.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=Pulsar exclusive_cores - isolated, no load balancing, no tick
+Before=slices.target
+
+[Slice]
+# exclusive_cores (isolated) = 11-47
+# shared_cores (NOT in this slice) = 4-10
+AllowedCPUs=11-47
+AllowedMemoryNodes=0
+CPUAccounting=yes
+MemoryAccounting=yes
+# The latency path must never be reclaimed under pressure.
+MemorySwapMax=0
+```
+
+#### `c7i-48xl`
+
+c7i.metal-48xl · Intel Sapphire Rapids · 2 sockets × 48 cores · 2 NUMA nodes (SNC disabled) · L3 domain 48 cores · SMT 2 → disabled at boot
+
+**`/etc/systemd/system/system.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+# housekeeping = 0-1,48-49
+# shared_cores = 4-10,52-58
+AllowedCPUs=0-1,4-10,48-49,52-58
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/user.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1,48-49
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/machine.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1,48-49
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/init.scope.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Scope]
+AllowedCPUs=0-1,48-49
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/irqnet.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=IRQ handling, softirq and NIC housekeeping
+Before=slices.target
+
+[Slice]
+AllowedCPUs=2-3,50-51
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+```
+
+**`/etc/systemd/system/pulsar.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=Pulsar exclusive_cores - isolated, no load balancing, no tick
+Before=slices.target
+
+[Slice]
+# exclusive_cores (isolated) = 11-47,59-95
+# shared_cores (NOT in this slice) = 4-10,52-58
+AllowedCPUs=11-47,59-95
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+MemoryAccounting=yes
+# The latency path must never be reclaimed under pressure.
+MemorySwapMax=0
+```
+
+#### `c8i-48xl`
+
+c8i.metal-48xl · Intel Xeon 6 (Granite Rapids) · 1 socket × 96 cores · 3 NUMA nodes (SNC3) · L3 domain 32 cores · SMT 2 → disabled at boot
+
+**`/etc/systemd/system/system.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+# housekeeping = 0-1,32-33,64-65
+# shared_cores = 4-8,36-40,68-72
+AllowedCPUs=0-1,4-8,32-33,36-40,64-65,68-72
+AllowedMemoryNodes=0-2
+```
+
+**`/etc/systemd/system/user.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1,32-33,64-65
+AllowedMemoryNodes=0-2
+```
+
+**`/etc/systemd/system/machine.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1,32-33,64-65
+AllowedMemoryNodes=0-2
+```
+
+**`/etc/systemd/system/init.scope.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Scope]
+AllowedCPUs=0-1,32-33,64-65
+AllowedMemoryNodes=0-2
+```
+
+**`/etc/systemd/system/irqnet.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=IRQ handling, softirq and NIC housekeeping
+Before=slices.target
+
+[Slice]
+AllowedCPUs=2-3,34-35,66-67
+AllowedMemoryNodes=0-2
+CPUAccounting=yes
+```
+
+**`/etc/systemd/system/pulsar.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=Pulsar exclusive_cores - isolated, no load balancing, no tick
+Before=slices.target
+
+[Slice]
+# exclusive_cores (isolated) = 9-31,41-63,73-95
+# shared_cores (NOT in this slice) = 4-8,36-40,68-72
+AllowedCPUs=9-31,41-63,73-95
+AllowedMemoryNodes=0-2
+CPUAccounting=yes
+MemoryAccounting=yes
+# The latency path must never be reclaimed under pressure.
+MemorySwapMax=0
+```
+
+#### `c8i-96xl`
+
+c8i.metal-96xl · Intel Xeon 6975P-C · 2 sockets × 96 cores · 6 NUMA nodes (SNC3) · L3 domain 32 cores · SMT 2 → disabled at boot
+
+**`/etc/systemd/system/system.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+# housekeeping = 0-1,32-33,64-65,96-97,128-129,160-161
+# shared_cores = 4-8,36-40,68-72,100-104,132-136,164-168
+AllowedCPUs=0-1,4-8,32-33,36-40,64-65,68-72,96-97,100-104,128-129,132-136,160-161,164-168
+AllowedMemoryNodes=0-5
+```
+
+**`/etc/systemd/system/user.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1,32-33,64-65,96-97,128-129,160-161
+AllowedMemoryNodes=0-5
+```
+
+**`/etc/systemd/system/machine.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-1,32-33,64-65,96-97,128-129,160-161
+AllowedMemoryNodes=0-5
+```
+
+**`/etc/systemd/system/init.scope.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Scope]
+AllowedCPUs=0-1,32-33,64-65,96-97,128-129,160-161
+AllowedMemoryNodes=0-5
+```
+
+**`/etc/systemd/system/irqnet.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=IRQ handling, softirq and NIC housekeeping
+Before=slices.target
+
+[Slice]
+AllowedCPUs=2-3,34-35,66-67,98-99,130-131,162-163
+AllowedMemoryNodes=0-5
+CPUAccounting=yes
+```
+
+**`/etc/systemd/system/pulsar.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=Pulsar exclusive_cores - isolated, no load balancing, no tick
+Before=slices.target
+
+[Slice]
+# exclusive_cores (isolated) = 9-31,41-63,73-95,105-127,137-159,169-191
+# shared_cores (NOT in this slice) = 4-8,36-40,68-72,100-104,132-136,164-168
+AllowedCPUs=9-31,41-63,73-95,105-127,137-159,169-191
+AllowedMemoryNodes=0-5
+CPUAccounting=yes
+MemoryAccounting=yes
+# The latency path must never be reclaimed under pressure.
+MemorySwapMax=0
+```
+
+#### `c7a-48xl`
+
+c7a.metal-48xl · AMD EPYC 9R14 (Genoa) · 2 sockets × 96 cores · 2 NUMA nodes (NPS1) · L3 domain 8 cores · SMT already off (AWS)
+
+**`/etc/systemd/system/system.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+# housekeeping = 0-3,96-99
+# shared_cores = 9-23,105-119
+AllowedCPUs=0-3,9-23,96-99,105-119
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/user.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-3,96-99
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/machine.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-3,96-99
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/init.scope.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Scope]
+AllowedCPUs=0-3,96-99
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/irqnet.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=IRQ handling, softirq and NIC housekeeping
+Before=slices.target
+
+[Slice]
+AllowedCPUs=4-8,100-104
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+```
+
+**`/etc/systemd/system/pulsar.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=Pulsar exclusive_cores - isolated, no load balancing, no tick
+Before=slices.target
+
+[Slice]
+# exclusive_cores (isolated) = 24-95,120-191
+# shared_cores (NOT in this slice) = 9-23,105-119
+AllowedCPUs=24-95,120-191
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+MemoryAccounting=yes
+# The latency path must never be reclaimed under pressure.
+MemorySwapMax=0
+```
+
+#### `c8a-24xl`
+
+c8a.metal-24xl · AMD EPYC Turin · 1 socket × 96 cores · 1 NUMA node (NPS1) · L3 domain 8 cores · SMT already off (AWS)
+
+**`/etc/systemd/system/system.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+# housekeeping = 0-3
+# shared_cores = 9-23
+AllowedCPUs=0-3,9-23
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/user.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-3
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/machine.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-3
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/init.scope.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Scope]
+AllowedCPUs=0-3
+AllowedMemoryNodes=0
+```
+
+**`/etc/systemd/system/irqnet.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=IRQ handling, softirq and NIC housekeeping
+Before=slices.target
+
+[Slice]
+AllowedCPUs=4-8
+AllowedMemoryNodes=0
+CPUAccounting=yes
+```
+
+**`/etc/systemd/system/pulsar.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=Pulsar exclusive_cores - isolated, no load balancing, no tick
+Before=slices.target
+
+[Slice]
+# exclusive_cores (isolated) = 24-95
+# shared_cores (NOT in this slice) = 9-23
+AllowedCPUs=24-95
+AllowedMemoryNodes=0
+CPUAccounting=yes
+MemoryAccounting=yes
+# The latency path must never be reclaimed under pressure.
+MemorySwapMax=0
+```
+
+#### `c8a-48xl`
+
+c8a.metal-48xl · AMD EPYC Turin · 2 sockets × 96 cores · 2 NUMA nodes (NPS1) · L3 domain 8 cores · SMT already off (AWS)
+
+**`/etc/systemd/system/system.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+# housekeeping = 0-3,96-99
+# shared_cores = 9-23,105-119
+AllowedCPUs=0-3,9-23,96-99,105-119
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/user.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-3,96-99
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/machine.slice.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Slice]
+AllowedCPUs=0-3,96-99
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/init.scope.d/10-lowlatency.conf`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Scope]
+AllowedCPUs=0-3,96-99
+AllowedMemoryNodes=0-1
+```
+
+**`/etc/systemd/system/irqnet.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=IRQ handling, softirq and NIC housekeeping
+Before=slices.target
+
+[Slice]
+AllowedCPUs=4-8,100-104
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+```
+
+**`/etc/systemd/system/pulsar.slice`**
+
+```ini
+# Managed by lltune. Regenerate with: lltune render
+[Unit]
+Description=Pulsar exclusive_cores - isolated, no load balancing, no tick
+Before=slices.target
+
+[Slice]
+# exclusive_cores (isolated) = 24-95,120-191
+# shared_cores (NOT in this slice) = 9-23,105-119
+AllowedCPUs=24-95,120-191
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+MemoryAccounting=yes
+# The latency path must never be reclaimed under pressure.
+MemorySwapMax=0
+```
+
+## Part 3 — Invariants that tie the two layers together
+
+Checked at generation time across all seven profiles, and again on the host by
+`lltune validate` (which reads `/proc/cmdline` and the live cpusets, not this document).
+
+| Invariant | Holds for |
+|---|---|
+| `pulsar.slice` `AllowedCPUs` == the `isolcpus` list on the cmdline | all 7 shapes |
+| `isolcpus` == `nohz_full` == `rcu_nocbs` | all 7 shapes |
+| `irqaffinity` shares no CPU with `isolcpus` | all 7 shapes |
+| cpu0 is housekeeping, never isolated | all 7 shapes |
+| `system.slice` + `irqnet.slice` + `pulsar.slice` partition every core | all 7 shapes |
+| housekeeping-only units are a subset of `system.slice` | all 7 shapes |
+| every slice gets every NUMA node in `AllowedMemoryNodes` | all 7 shapes |
+
+---
+
+Regenerate: `./scripts/build-config-reference.py` · terminal equivalent: `./bin/lltune layers --profile <name>` · live host: `./bin/lltune render --live -o out/`
