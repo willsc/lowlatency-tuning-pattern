@@ -1,5 +1,16 @@
 # Example of how an application consumes the plan. Copy to
 # /etc/systemd/system/pulsar-broker.service and adapt.
+#
+# Two units, because the two pools cannot be reached from one cgroup: a cpuset
+# intersects with its parent's, so anything under pulsar.slice is capped at the
+# isolated cores no matter what it asks for.
+#
+#   pulsar-broker.service    Slice=pulsar.slice          -> exclusive cores
+#   pulsar-support.service   Slice=pulsar-support.slice  -> shared cores
+#
+# pulsar-support.slice is deliberately NOT managed by lltune: with no AllowedCPUs
+# of its own it inherits the root cpuset, so the unit keeps init's affinity mask -
+# every core except the isolated ones - and pins itself onto SHARED_CORES.
 [Unit]
 Description=Pulsar broker (exclusive cores)
 After=lltune-runtime.service
@@ -7,13 +18,16 @@ Requires=lltune-runtime.service
 
 [Service]
 Type=simple
-# The slice grants access to both pools: moving a task into a cpuset rewrites its
-# affinity mask, which is the only way onto an isolcpus'd core. Which cores inside the
-# slice a thread lands on is the app's decision, from EXCLUSIVE_CORES / SHARED_CORES.
+# The slice is the grant: moving a task into a cpuset rewrites its affinity mask,
+# which is the only way onto an isolcpus'd core. Which cores inside the slice a
+# thread lands on is the app's decision, from EXCLUSIVE_CORES.
 Slice=pulsar.slice
 EnvironmentFile=/etc/lowlatency/cores.env
 Environment=PULSAR_MEM=-Xms32g -Xmx32g -XX:+UseLargePages -XX:+AlwaysPreTouch
-# The app reads EXCLUSIVE_CORES / SHARED_CORES and pins its own IO threads.
+# Spend NIC_LOCAL_EXCLUSIVE_CORES first: those are the exclusive cores on the NUMA
+# node the primary NIC hangs off. Cores on any other node pay a die crossing or a
+# socket hop per packet, which no amount of isolation buys back. NUMA_NODE_ORDER
+# ranks the rest, nearest first.
 ExecStart=/opt/pulsar/bin/pulsar broker
 LimitMEMLOCK=infinity
 LimitNOFILE=1048576
@@ -23,3 +37,22 @@ Nice=-10
 
 [Install]
 WantedBy=multi-user.target
+
+# ---------------------------------------------------------------------------
+# Companion unit for the shared pool. Note there is no Slice=system.slice here:
+# system.slice is confined to housekeeping, so leaving this on the default would
+# strand admin and background work on the platform's own cores.
+#
+# /etc/systemd/system/pulsar-support.service
+#
+#   [Unit]
+#   Description=Pulsar admin and background work (shared cores)
+#   After=pulsar-broker.service
+#
+#   [Service]
+#   Slice=pulsar-support.slice
+#   EnvironmentFile=/etc/lowlatency/cores.env
+#   ExecStart=/opt/pulsar/bin/pulsar-admin ...
+#
+#   [Install]
+#   WantedBy=multi-user.target

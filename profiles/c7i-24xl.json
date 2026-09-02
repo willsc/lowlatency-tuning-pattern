@@ -14,6 +14,8 @@
   "confidence": {
     "sku_and_vcpus": "verified - AWS c7i instance page",
     "sockets_and_cores": "derived from vCPU count and SMT2",
-    "numa_nodes": "ASSUMED. SNC is not documented as enabled for SPR on EC2. Confirm with 'lltune topology --live'."
-  }
+    "numa_nodes": "ASSUMED. SNC is not documented as enabled for SPR on EC2. Confirm with 'lltune topology --live'.",
+    "nic_numa_node": "VERIFIED BY CONSTRUCTION - the shape has exactly one NUMA node, so the primary ENA is local to it whatever root complex it hangs off."
+  },
+  "nic_locality": "single NUMA node"
 }

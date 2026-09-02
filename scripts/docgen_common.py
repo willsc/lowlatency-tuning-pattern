@@ -1,6 +1,6 @@
 """Shared material for the documentation generators.
 
-Both docs/layers.html and docs/CONFIG-REFERENCE.md describe the same kernel
+docs/ARCHITECTURES.* and docs/CONFIG-REFERENCE.* describe the same kernel
 arguments. Keeping the explanations here means the two cannot disagree about
 what a flag does — the same drift the planner exists to prevent, one level up.
 """

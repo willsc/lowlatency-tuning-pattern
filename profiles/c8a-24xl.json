@@ -14,6 +14,8 @@
   "confidence": {
     "sku_and_vcpus": "verified - AWS c8a instance page",
     "cores_per_l3": "ASSUMED classic Zen 5 (8-core CCX). The 4.5 GHz max frequency points to classic rather than Zen 5c dense, which would be 16. Confirm with --live: it moves where the exclusive block starts.",
-    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'."
-  }
+    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'.",
+    "nic_numa_node": "VERIFIED BY CONSTRUCTION - the shape has exactly one NUMA node, so the primary ENA is local to it whatever root complex it hangs off."
+  },
+  "nic_locality": "single NUMA node"
 }

@@ -14,6 +14,12 @@ Cores are sorted by `(l3_domain, core_id)` and cut in this order:
  \_______________ non-isolated ________/     \____ isolcpus / nohz_full / rcu_nocbs ___/
 ```
 
+The same cut is made on every NUMA node, so each node is self-sufficient: it has its own
+housekeeping and IRQ cores, and per-node kernel work never has to cross a domain. What
+differs between nodes is not the cut but the *value* of the exclusive block it produces —
+see §2 for how the nodes are then ranked by distance from the NIC, and why that ranking is
+the number the application should actually plan against.
+
 Low-numbered cores go to the platform for two reasons. cpu0 cannot be isolated — it takes
 boot-time work, some legacy timer duties, and on many kernels the fallback for anything
 with no valid affinity — so the housekeeping block has to start there anyway. And keeping
@@ -91,24 +97,59 @@ Three times the reservation. Worse, the wrong plan puts *no* housekeeping core i
 six domains, so kernel per-node work on those dies has to run cross-domain or lands on an
 isolated core — which is precisely the jitter the design exists to remove.
 
-### The consequence nobody likes: NIC locality under SNC3
+### The consequence nobody likes: NIC locality
 
-The ENA adapter attaches to **one die on one socket**. Under SNC3 that means only ~32 of the
-192 cores on a `c8i.metal-96xl` are in the NIC's own NUMA domain. Cores on the other five
-domains pay a die crossing (nodes 1–2) or a UPI traversal (nodes 3–5) on every packet
-descriptor and DMA buffer touch.
+The ENA adapter attaches to **one PCIe root complex, on one die of one socket**. Under SNC3
+that means only ~32 of the 192 cores on a `c8i.metal-96xl` are in the NIC's own NUMA domain.
+Cores on the other five domains pay a die crossing or a UPI traversal on every packet
+descriptor and DMA buffer touch, and no amount of core isolation fixes an interconnect hop.
 
-No amount of core isolation fixes an interconnect hop. So on `c8i`:
+So exclusive cores are not interchangeable, and the planner does not pretend they are. It
+ranks every NUMA node by its distance from the NIC and hands the application the exclusive
+cores in that order:
 
-- Put the latency-critical brokers on `EXCLUSIVE_CORES_NODE<nic_numa_node>` — that is the
-  real low-latency budget, and it is **23 cores, not 138**.
-- Treat the other five domains as capacity for work that is throughput-bound rather than
-  tail-latency-bound.
-- If you need more than one die's worth of latency-critical cores, shard the application by
-  NUMA domain and pin each shard to its own die, rather than letting one broker straddle dies.
+```
+tier 0   the NIC's own node                the real low-latency budget
+tier 1   the rest of that socket           one die crossing
+tier 2   the other socket                  a UPI traversal as well
+```
 
-`lltune validate` fails if the running host's node count disagrees with the plan, and checks
-that every CPU the plan assigned to a node is actually resident on that node.
+The application gets `NUMA_NODE_ORDER` (nearest first), `NIC_LOCAL_EXCLUSIVE_CORES`, and the
+same exclusive pool broken out per tier. Spend tier 0 before anything else. On a
+`c8i.metal-96xl` that budget is **23 cores, not 138** — treat the other five domains as
+capacity for work that is throughput-bound rather than tail-latency-bound, and if you need
+more than one die's worth of latency-critical cores, shard the application by NUMA domain
+and pin each shard to its own die rather than letting one broker straddle dies.
+
+### Where the ranking comes from, and how far to trust it
+
+On a live host it is measured: the adapter's own `numa_node`, and the ACPI SLIT the kernel
+exposes at `/sys/devices/system/node/node*/distance`. From a profile there is no SLIT to
+read, so it falls back to a structural model — the NIC's own node, then the rest of that
+socket, then the other socket.
+
+**The NIC's node itself is inferred on every multi-node shape.** AWS publishes no PCIe
+root-complex map, and which socket (or, under SNC3, which die) the primary ENA hangs off is
+a platform wiring choice. The profiles assume node 0 and say so in their `confidence` block.
+Under SNC3 the root ports sit on the I/O dies flanking the three compute dies, so the NIC
+lands on an *edge* domain rather than the middle one — which narrows a `c8i` socket to two
+candidates and no further.
+
+```sh
+lltune nic --live       # the adapter, its NUMA node, the SLIT, and the resulting ranking
+```
+
+Run it on first contact with a shape and correct the profile. If the adapter reports
+`numa_node = -1`, firmware exposed no `_PXM` for it: that is not a machine without NIC
+locality, it is one whose locality you cannot read, and the plan falls back to node 0. Treat
+the ranking as unproven and measure it — pin a load generator to one node at a time and
+compare.
+
+`lltune validate` fails if the running host's node count disagrees with the plan, if its NIC
+node disagrees with the plan, or if any CPU the plan assigned to a node is not actually
+resident on that node. A wrong NIC node is not a cosmetic error: it turns the whole ranking
+upside down, and the cores the application is told to spend first become the worst ones on
+the box.
 
 ### Why the AMD side is simpler
 
@@ -175,12 +216,14 @@ The hierarchy:
 
 ```
 -.slice
-├── system.slice        AllowedCPUs = housekeeping + shared
+├── system.slice        AllowedCPUs = housekeeping
 ├── user.slice          AllowedCPUs = housekeeping
 ├── machine.slice       AllowedCPUs = housekeeping
 ├── init.scope          AllowedCPUs = housekeeping
 ├── irqnet.slice        AllowedCPUs = irqnet
 └── pulsar.slice        AllowedCPUs = exclusive          (isolated only)
+
+     shared_cores       named by no slice at all
 ```
 
 ### The cpuset boundary follows the isolation boundary
@@ -191,35 +234,51 @@ CPUs are out of every scheduler domain and out of init's inherited affinity mask
 reaches them without an explicit grant. `pulsar.slice` is that grant, and it therefore
 contains the isolated cores and nothing else.
 
-The shared cores have no such guarantee to gate. They are ordinary load-balanced CPUs that
-happen to be reserved by convention for the application's non-latency work. Wrapping them in
-their own cgroup would confine the app to cores it is already entitled to, in exchange for
-another cpuset that has to be regenerated and kept in step with every plan change — cost
-without a guarantee. So they sit in `system.slice`, which is where systemd puts ordinary
-services anyway, and are reachable with no further ceremony.
+The shared cores have no such guarantee to gate. They are ordinary load-balanced CPUs
+reserved by convention for the application's non-latency work, and a cpuset around them
+would confine the app to cores it is already entitled to in exchange for another list to
+keep in step with every plan change — cost without a guarantee. So no slice names them. They
+are reached the way any ordinary CPU is reached: through the affinity mask a process
+inherits from init, which is every online CPU that `isolcpus` did not take away.
 
-Two consequences worth being explicit about:
+The three managed cpusets are therefore disjoint and cover every core **except** the shared
+pool. `scripts/selftest.py` asserts both halves — the partition, and that no unit's
+`AllowedCPUs` names a shared core.
 
-- **Housekeeping and app shared work share one cpuset.** They are separated by convention
-  (`cores.env`) rather than by the kernel. If a runaway agent on a housekeeping core starts
-  competing with GC threads, no cgroup will stop it. Add `CPUWeight=` on the individual
-  units if that becomes a real contention problem — that is the right tool, not a cpuset.
-- **`user.slice`, `machine.slice` and `init.scope` stay housekeeping-only.** An SSH session
-  or a container has no business on the shared pool, and confining them keeps the shared
-  cores predictable for the application.
+### Where shared work actually runs
 
-The split between `exclusive_cores` and `shared_cores` is enforced where it belongs — in the
-application, which reads both lists from `cores.env` and pins its own threads. No cgroup can
-tell a broker's IO thread from its GC thread. The `pulsar.slice` and `system.slice` units
-each carry the relevant lists as comments, so both files stay self-describing when read in
-`/etc/systemd/system` with no plan to hand.
+This is the part that bites if you skip it. `system.slice` is confined to **housekeeping**,
+and a service with no `Slice=` goes to `system.slice`. So the default placement no longer
+reaches the shared pool:
+
+| Where a unit runs | Effective CPUs | Good for |
+|---|---|---|
+| `Slice=pulsar.slice` | exclusive only | the latency path |
+| default (`system.slice`) | housekeeping only | agents, exporters, ordinary services |
+| a slice `lltune` does not manage | everything except the isolated cores | the application's shared-pool work |
+
+A unit that needs the shared cores must therefore name a slice of its own — anything
+`lltune` does not render an `AllowedCPUs` for. Such a slice inherits the root cpuset, so the
+unit keeps init's mask (housekeeping + irqnet + shared) and pins itself onto `SHARED_CORES`
+from there.
+
+One consequence to be deliberate about: **a single process cannot span both pools through
+cgroups.** A cpuset intersects with its parent's, so a unit under `pulsar.slice` is capped
+at the isolated cores no matter what it asks for. If the latency path and the shared work
+are one JVM, either run the process in an unmanaged slice and let it pull its own isolated
+threads in with `sched_setaffinity` after start-up, or split it into two units. Splitting is
+the version that fails safely, because the isolated grant stays a cgroup property rather
+than something the app can get wrong at runtime.
 
 **Escape hatch:** `user.slice` is confined to housekeeping, so an SSH session cannot profile
 an isolated core directly. Use `systemd-run --slice=pulsar.slice -t perf ...`.
 
-**Where a service lands by default:** anything with no `Slice=` goes to `system.slice`, so it
-gets housekeeping + shared and can never touch an isolated core by accident. Reaching the
-latency path requires naming `Slice=pulsar.slice` — which is the fail-safe direction.
+The split between `exclusive_cores` and `shared_cores` is enforced where it belongs — in the
+application, which reads both lists from the core contract and pins its own threads. No
+cgroup can tell a broker's IO thread from its GC thread. The `pulsar.slice` and
+`system.slice` units each carry the relevant lists as comments, including the shared list
+they deliberately do not grant, so both files stay self-describing when read in
+`/etc/systemd/system` with no plan to hand.
 
 ### What is deliberately not used
 

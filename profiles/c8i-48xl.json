@@ -14,6 +14,8 @@
   "confidence": {
     "sku_and_vcpus": "verified - AWS c8i instance page",
     "numa_nodes": "SNC3 is Intel's default on Xeon 6900P and is the mode AWS runs. 3 dies per socket => 3 NUMA nodes, 32 cores each.",
-    "cores_per_l3": "SNC3 restricts L3 to each compute die: 96 cores / 3 dies = 32 cores per L3 domain."
-  }
+    "cores_per_l3": "SNC3 restricts L3 to each compute die: 96 cores / 3 dies = 32 cores per L3 domain.",
+    "nic_numa_node": "ASSUMED node 0. Under SNC3 the PCIe root ports live on the I/O dies that flank the three compute dies, so firmware assigns the NIC to an EDGE domain - node 0 or node 2, not the middle die. Which of the two is a wiring choice AWS does not publish. Settle it with 'lltune nic --live'."
+  },
+  "nic_locality": "1 socket, SNC3 - only ~1/3 of the socket is NIC-local"
 }

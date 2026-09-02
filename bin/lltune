@@ -92,6 +92,7 @@ def topology_from_profile(profile):
         "total_cpus": total * tpc,
         "cores_per_l3": l3,
         "nic_numa_node": profile.get("nic_numa_node", 0),
+        "nic_numa_node_source": "profile",
         "cores": cores,
     }
 
@@ -143,6 +144,8 @@ def topology_live():
         l3_sizes[c["l3"]] = l3_sizes.get(c["l3"], 0) + 1
 
     vendor = "amd" if "AMD" in _read("/proc/cpuinfo", "") else "intel"
+    iface = primary_iface()
+    nic_node, nic_src = nic_numa_node(iface)
     return {
         "source": "live",
         "vendor": vendor,
@@ -152,20 +155,30 @@ def topology_live():
         "total_cores": len(cores),
         "total_cpus": sum(len(c["threads"]) for c in cores),
         "cores_per_l3": min(l3_sizes.values()) if l3_sizes else len(cores),
-        "nic_numa_node": nic_numa_node(),
+        "nic_numa_node": nic_node,
+        "nic_numa_node_source": nic_src,
+        "primary_iface": iface,
+        "node_distance": node_distances_live(),
         "cores": cores,
     }
 
 
 def nic_numa_node(iface=None):
+    """(node, source). source is 'device' only when firmware actually said so.
+
+    An ENA that reports -1 has no _PXM in the firmware tables. Falling back to node 0 is
+    the only thing left to do, but it must not be mistaken for a measurement: on a
+    multi-node host that fallback silently inverts the whole NIC-distance ranking.
+    """
     iface = iface or primary_iface()
     if not iface:
-        return 0
-    n = _read(f"/sys/class/net/{iface}/device/numa_node", "0")
+        return 0, "no-interface"
+    n = _read(f"/sys/class/net/{iface}/device/numa_node", "")
     try:
-        return max(0, int(n))
+        val = int(n)
     except ValueError:
-        return 0
+        return 0, "unreadable"
+    return (val, "device") if val >= 0 else (0, "no-pxm")
 
 
 def primary_iface():
@@ -175,6 +188,94 @@ def primary_iface():
             continue
         return name
     return None
+
+
+def node_distances_live():
+    """The ACPI SLIT, as the kernel exposes it: {node: {node: distance}}."""
+    out = {}
+    for nd in glob.glob("/sys/devices/system/node/node[0-9]*"):
+        n = int(re.search(r"node(\d+)$", nd).group(1))
+        row = _read(Path(nd) / "distance", "")
+        if row:
+            out[n] = {i: int(v) for i, v in enumerate(row.split())}
+    return out
+
+
+# ---------------------------------------------------------------- nic locality
+
+def node_socket_map(topo):
+    m = {}
+    for c in topo["cores"]:
+        m.setdefault(c["node"], c["socket"])
+    return m
+
+
+def _tier_label(tier, members, nic, sock):
+    if tier == 0:
+        return "NIC-local"
+    same = all(sock.get(n) == sock.get(nic) for n in members)
+    return "same socket, remote die" if same else "remote socket"
+
+
+def build_nic_locality(topo, distances=None):
+    """Rank every NUMA node by how close it is to the primary NIC.
+
+    Tier 0 is the NIC's own node, tier 1 the next-closest set, and so on. The exclusive
+    cores on tier 0 are the ones worth spending first: no amount of core isolation buys
+    back a die crossing or a UPI hop on every packet descriptor and DMA buffer touch.
+
+    On a live host the ranking is the real ACPI SLIT. A profile has no SLIT to read, so
+    it falls back to the structural model - own node, then the rest of the same socket
+    nearest-die first, then the other socket. That model is an inference, and the
+    `source` field says so; `lltune nic --live` is what settles it on first contact.
+    """
+    nodes = sorted({c["node"] for c in topo["cores"]})
+    nic = topo.get("nic_numa_node", 0)
+    if nic not in nodes:
+        nic = nodes[0]
+    sock = node_socket_map(topo)
+
+    if distances and nic in distances:
+        key = {n: distances[nic].get(n, 255) for n in nodes}
+        source = "acpi-slit"
+    else:
+        # Sibling dies inside a socket sit at one SLIT distance from each other, so they
+        # form a single tier; the other socket is one more hop behind whatever it holds.
+        key = {}
+        for n in nodes:
+            if n == nic:
+                key[n] = 0
+            elif sock.get(n) == sock.get(nic):
+                key[n] = 10
+            else:
+                key[n] = 100 + abs(sock.get(n, 0) - sock.get(nic, 0))
+        source = "structural-model"
+
+    # Within a tier, prefer the nearer node id: on SNC the die next to the NIC's die is
+    # the better of two equal-distance choices even when the SLIT cannot say so.
+    order = sorted(nodes, key=lambda n: (key[n], abs(n - nic), n))
+    tiers = []
+    for t, k in enumerate(sorted({key[n] for n in nodes})):
+        members = [n for n in order if key[n] == k]
+        tiers.append({
+            "tier": t,
+            "nodes": members,
+            "distance": distances[nic][members[0]] if source == "acpi-slit" else None,
+            "label": _tier_label(t, members, nic, sock),
+        })
+    node_source = topo.get("nic_numa_node_source", "profile")
+    return {
+        "nic_numa_node": nic,
+        "nic_numa_node_source": node_source,
+        "source": source,
+        # Both halves have to be real for the ranking to be trustworthy: the SLIT says how
+        # far the nodes are from each other, but it is worthless if the node we measured
+        # from was a guess.
+        "verified": (len(nodes) == 1
+                     or (source == "acpi-slit" and node_source == "device")),
+        "node_order": order,
+        "tiers": tiers,
+    }
 
 
 # ---------------------------------------------------------------- planner
@@ -193,6 +294,9 @@ def build_plan(topo, policy, profile_name=None):
         return [core["threads"][0]] if smt_off else list(core["threads"])
 
     nodes = sorted({c["node"] for c in topo["cores"]})
+    locality = build_nic_locality(topo, topo.get("node_distance"))
+    tier_of = {n: t["tier"] for t in locality["tiers"] for n in t["nodes"]}
+    rank_of = {n: i for i, n in enumerate(locality["node_order"])}
     roles = {r: [] for r in ("housekeeping", "irqnet", "shared", "exclusive")}
     per_node = []
 
@@ -226,7 +330,8 @@ def build_plan(topo, policy, profile_name=None):
                 "shared": cores[hk + irq:non_iso],
                 "exclusive": cores[non_iso:]}
 
-        entry = {"node": node, "cores_total": n}
+        entry = {"node": node, "cores_total": n,
+                 "nic_tier": tier_of[node], "nic_rank": rank_of[node]}
         for role, sel in cuts.items():
             roles[role].extend(sel)
             cpus = [cpu for c in sel for cpu in cpus_of(c)]
@@ -251,6 +356,7 @@ def build_plan(topo, policy, profile_name=None):
         "nodes": per_node,
         "roles": {r: {"core_count": len(roles[r]), "cpu_count": len(role_cpus[r]),
                       "cpus": compress(role_cpus[r])} for r in roles},
+        "nic_locality": locality,
         "isolated_cpus": compress(isolated),
         "non_isolated_cpus": compress(non_isolated),
         "irq_landing_cpus": compress(housekeeping_all),
@@ -316,19 +422,49 @@ def build_cmdline(plan, topo, policy):
 
 
 def build_app_contract(plan):
-    """What the application reads. exclusive_cores == isolated, shared_cores == non-isolated app pool."""
+    """What the application reads. exclusive_cores == isolated, shared_cores == non-isolated app pool.
+
+    The flat lists are the whole pool. The *ranked* lists are the ones that decide latency:
+    they hand back the same cores ordered by distance from the primary NIC, nearest first,
+    so an application that cannot use every exclusive core spends the NIC-local ones first.
+    """
+    loc = plan["nic_locality"]
+    by_node = {n["node"]: n for n in plan["nodes"]}
     app = {
         "exclusive_cores": plan["roles"]["exclusive"]["cpus"],
         "shared_cores": plan["roles"]["shared"]["cpus"],
         "exclusive_core_count": plan["roles"]["exclusive"]["cpu_count"],
         "shared_core_count": plan["roles"]["shared"]["cpu_count"],
+        "nic_numa_node": loc["nic_numa_node"],
+        "nic_locality_source": loc["source"],
+        "nic_numa_node_source": loc["nic_numa_node_source"],
+        "nic_locality_verified": loc["verified"],
+        "numa_node_order": loc["node_order"],
         "per_node": {},
     }
     for n in plan["nodes"]:
         app["per_node"][str(n["node"])] = {
             "exclusive_cores": n["exclusive"]["cpus"],
             "shared_cores": n["shared"]["cpus"],
+            "nic_tier": n["nic_tier"],
+            "nic_rank": n["nic_rank"],
         }
+
+    # Nearest-NIC-first: one entry per node, in preference order.
+    app["exclusive_cores_ranked"] = [by_node[n]["exclusive"]["cpus"] for n in loc["node_order"]]
+    app["shared_cores_ranked"] = [by_node[n]["shared"]["cpus"] for n in loc["node_order"]]
+
+    # Collapsed to one entry per distance tier, which is what most apps actually shard on.
+    excl_tier, shared_tier = {}, {}
+    for t in loc["tiers"]:
+        excl_tier[str(t["tier"])] = compress(
+            [c for n in t["nodes"] for c in expand(by_node[n]["exclusive"]["cpus"])])
+        shared_tier[str(t["tier"])] = compress(
+            [c for n in t["nodes"] for c in expand(by_node[n]["shared"]["cpus"])])
+    app["exclusive_cores_by_tier"] = excl_tier
+    app["shared_cores_by_tier"] = shared_tier
+    app["nic_local_exclusive_cores"] = excl_tier["0"]
+    app["nic_local_exclusive_core_count"] = len(expand(excl_tier["0"]))
     return app
 
 
@@ -353,16 +489,17 @@ def render_slices(plan):
     mem = plan["memory_nodes"]
     out = {}
 
-    # system.slice is where systemd puts ordinary services, so it carries the shared pool
-    # as well as housekeeping: shared cores are not isolated, nothing about them needs
-    # gating, and this is what makes them reachable without inventing a cgroup for them.
-    hk_shared = compress(expand(hk) + expand(shared))
+    # system.slice carries housekeeping and nothing else. The shared cores are deliberately
+    # in no cpuset at all: they are ordinary load-balanced CPUs with no kernel guarantee for
+    # a cpuset to gate, and confining ordinary services to housekeeping keeps them off the
+    # application's pool. A unit that needs the shared cores must therefore NOT sit under
+    # system.slice - see docs/DESIGN.md section 4.
     out["system.slice.d/10-lowlatency.conf"] = (
         SLICE_HEADER +
         "[Slice]\n"
         f"# housekeeping = {hk}\n"
-        f"# shared_cores = {shared}\n"
-        f"AllowedCPUs={hk_shared}\n"
+        f"# shared_cores = {shared}  (NOT granted here; no cpuset owns them)\n"
+        f"AllowedCPUs={hk}\n"
         f"AllowedMemoryNodes={mem}\n"
     )
 
@@ -389,8 +526,8 @@ def render_slices(plan):
 
     # The application slice holds the isolated cores and nothing else. The cpuset exists
     # to gate access to isolcpus'd CPUs, which is a real guarantee; the shared cores are
-    # ordinary load-balanced CPUs with no guarantee for a cpuset to enforce, so they are
-    # not in here. See docs/DESIGN.md for where shared_cores live instead.
+    # ordinary load-balanced CPUs with no guarantee for a cpuset to enforce, so no slice
+    # names them. See docs/DESIGN.md section 4 for how a unit reaches them instead.
     out["pulsar.slice"] = (
         SLICE_HEADER +
         "[Unit]\n"
@@ -398,7 +535,7 @@ def render_slices(plan):
         "Before=slices.target\n\n"
         "[Slice]\n"
         f"# exclusive_cores (isolated) = {excl}\n"
-        f"# shared_cores (NOT in this slice) = {shared}\n"
+        f"# shared_cores (in no cpuset, reached by inherited affinity) = {shared}\n"
         f"AllowedCPUs={excl}\n"
         f"AllowedMemoryNodes={mem}\n"
         "CPUAccounting=yes\n"
@@ -430,11 +567,29 @@ def render_cores_env(plan):
         f"ISOLATED_CPUS={plan['isolated_cpus']}",
         f"NON_ISOLATED_CPUS={plan['non_isolated_cpus']}",
         "",
-        "# --- per NUMA node ---",
+        "# --- NIC locality: nodes ranked by distance from the primary NIC, nearest first ---",
+        f"NIC_NUMA_NODE={a['nic_numa_node']}",
+        f"NIC_NUMA_NODE_SOURCE={a['nic_numa_node_source']}",
+        f"NIC_LOCALITY_SOURCE={a['nic_locality_source']}",
+        f"NIC_LOCALITY_VERIFIED={'yes' if a['nic_locality_verified'] else 'no'}",
+        f"NUMA_NODE_ORDER={','.join(str(n) for n in a['numa_node_order'])}",
+        f"NIC_LOCAL_EXCLUSIVE_CORES={a['nic_local_exclusive_cores']}",
+        f"NIC_LOCAL_EXCLUSIVE_CORE_COUNT={a['nic_local_exclusive_core_count']}",
+        "# Nearest-first, one field per node, '|' separated. Spend these left to right.",
+        "# Quoted: an unquoted '|' would be a pipeline to a shell sourcing this file.",
+        f"EXCLUSIVE_CORES_RANKED=\"{'|'.join(a['exclusive_cores_ranked'])}\"",
+        f"SHARED_CORES_RANKED=\"{'|'.join(a['shared_cores_ranked'])}\"",
+        "",
+        "# --- per NIC distance tier ---",
     ]
+    for tier in sorted(a["exclusive_cores_by_tier"], key=int):
+        lines.append(f"EXCLUSIVE_CORES_TIER{tier}={a['exclusive_cores_by_tier'][tier]}")
+        lines.append(f"SHARED_CORES_TIER{tier}={a['shared_cores_by_tier'][tier]}")
+    lines += ["", "# --- per NUMA node ---"]
     for node, v in sorted(a["per_node"].items(), key=lambda kv: int(kv[0])):
         lines.append(f"EXCLUSIVE_CORES_NODE{node}={v['exclusive_cores']}")
         lines.append(f"SHARED_CORES_NODE{node}={v['shared_cores']}")
+        lines.append(f"NIC_TIER_NODE{node}={v['nic_tier']}")
     return "\n".join(lines) + "\n"
 
 
@@ -507,13 +662,16 @@ def cmd_show(args):
     print(f"cores     : {t['total_cores']} physical / {t['total_cpus']} logical "
           f"-> {plan['roles']['exclusive']['cpu_count'] + plan['roles']['shared']['cpu_count'] + plan['roles']['housekeeping']['cpu_count'] + plan['roles']['irqnet']['cpu_count']} usable after SMT policy")
     print()
-    hdr = f"{'node':>4}  {'housekeeping':>26}  {'irqnet':>22}  {'shared':>26}  {'exclusive':>30}"
+    hdr = (f"{'node':>4} {'tier':>5}  {'housekeeping':>26}  {'irqnet':>22}  "
+           f"{'shared':>26}  {'exclusive':>30}")
     print(hdr)
     print("-" * len(hdr))
     for n in plan["nodes"]:
-        print(f"{n['node']:>4}  {n['housekeeping']['cpus']:>26}  {n['irqnet']['cpus']:>22}  "
-              f"{n['shared']['cpus']:>26}  {n['exclusive']['cpus']:>30}")
+        tier = n.get("nic_tier", "-")
+        print(f"{n['node']:>4} {tier:>5}  {n['housekeeping']['cpus']:>26}  "
+              f"{n['irqnet']['cpus']:>22}  {n['shared']['cpus']:>26}  {n['exclusive']['cpus']:>30}")
     print()
+    print_nic_locality(plan)
     for r in ("housekeeping", "irqnet", "shared", "exclusive"):
         v = plan["roles"][r]
         pct = 100.0 * v["cpu_count"] / max(1, sum(plan["roles"][x]["cpu_count"] for x in plan["roles"]))
@@ -521,6 +679,9 @@ def cmd_show(args):
     print()
     print(f"  exclusive_cores (app) = {plan['app']['exclusive_cores']}")
     print(f"  shared_cores    (app) = {plan['app']['shared_cores']}")
+    if "nic_local_exclusive_cores" in plan["app"]:
+        print(f"  NIC-local exclusive   = {plan['app']['nic_local_exclusive_cores']} "
+              f"({plan['app']['nic_local_exclusive_core_count']} cpu) <- spend these first")
     print()
     print("cmdline:")
     for a in plan["cmdline"].split():
@@ -578,6 +739,8 @@ def cmd_layers(args):
             },
             "4_app_contract": {
                 "file": "/etc/lowlatency/cores.env",
+                "nic_numa_node": plan.get("nic_locality", {}).get("nic_numa_node"),
+                "numa_node_order": plan.get("nic_locality", {}).get("node_order"),
                 "env": render_cores_env(plan),
             },
         },
@@ -592,7 +755,9 @@ def cmd_layers(args):
           f"{t['total_cores'] // t['sockets']}c  |  {t['numa_nodes']} NUMA node(s)  |  "
           f"SMT {plan['policy'].get('smt')}  |  L3 domain {t['cores_per_l3']} cores")
     print(bar)
-    print("\n--- LAYER 1: GRUB (boot, needs reboot) "
+    print()
+    print_nic_locality(plan)
+    print("--- LAYER 1: GRUB (boot, needs reboot) "
           "-> /etc/default/grub.d/99-lowlatency.cfg\n")
     for a in plan["cmdline"].split():
         print(f"    {a}")
@@ -611,6 +776,71 @@ def cmd_layers(args):
         if line and not line.startswith("#"):
             print(f"    {line}")
     print()
+
+
+def print_nic_locality(plan):
+    # A plan.json written before NIC ranking existed has no locality block. Say so rather
+    # than crashing: 'lltune show' against an installed plan is a debugging tool.
+    loc = plan.get("nic_locality")
+    if not loc:
+        print("NIC locality: not in this plan - it predates NIC-distance ranking. "
+              "Re-plan to get it.\n")
+        return
+    node_src = {
+        "device": "read from the adapter",
+        "no-pxm": "GUESSED - the adapter reports no NUMA node",
+        "unreadable": "GUESSED - the adapter's numa_node is unreadable",
+        "no-interface": "GUESSED - no primary interface found",
+        "profile": "assumed by the profile, not measured",
+    }.get(loc.get("nic_numa_node_source", "profile"), "unknown")
+    dist_src = {"acpi-slit": "distances from the host's ACPI SLIT",
+                "structural-model": "distances inferred from the topology"}[loc["source"]]
+    print(f"NIC locality: primary NIC on node {loc['nic_numa_node']}  "
+          f"({node_src}; {dist_src})")
+    for t in loc["tiers"]:
+        nodes = ", ".join(f"node{n}" for n in t["nodes"])
+        dist = f"  SLIT distance {t['distance']}" if t["distance"] is not None else ""
+        cores = plan["app"]["exclusive_cores_by_tier"][str(t["tier"])]
+        print(f"  tier {t['tier']}  {t['label']:<24} {nodes:<34} exclusive {cores}{dist}")
+    if len(loc["node_order"]) == 1:
+        print("  one NUMA node: nothing to rank, and nothing the NIC's node can change")
+    elif not loc["verified"]:
+        print("  UNVERIFIED ranking. Run 'lltune nic --live' on a host of this shape; if the\n"
+              "  adapter reports no NUMA node, measure it by pinning load to one node at a time.")
+    print()
+
+
+def cmd_nic(args):
+    """Report which NUMA node the primary NIC actually sits on, and the resulting ranking.
+
+    This is the command to run on first contact with a shape: AWS publishes no PCIe
+    root-complex map, so the profile's nic_numa_node is an inference until a real host
+    has been read.
+    """
+    plan = plan_for(args)
+    live = getattr(args, "live", False)
+    if live:
+        iface = args.iface or primary_iface()
+        if not iface:
+            raise SystemExit("no non-loopback interface with a PCI device found")
+        raw = _read(f"/sys/class/net/{iface}/device/numa_node", "")
+        _, src = nic_numa_node(iface)
+        print(f"primary interface        {iface}")
+        print(f"  device                 {os.path.basename(os.path.realpath(f'/sys/class/net/{iface}/device'))}")
+        print(f"  numa_node (raw)        {raw or '<unreadable>'}"
+              + ("   <- no _PXM in firmware; falling back to node 0" if src == "no-pxm" else ""))
+        print()
+        dist = node_distances_live()
+        if dist:
+            nodes = sorted(dist)
+            print("ACPI SLIT (relative distance between NUMA nodes)")
+            print("        " + "".join(f"{n:>6}" for n in nodes))
+            for a in nodes:
+                print(f"  node{a:<3}" + "".join(f"{dist[a].get(b, '?'):>6}" for b in nodes))
+            print()
+    print_nic_locality(plan)
+    if not live:
+        print("this is the profile's model; add --live on a real host to measure it")
 
 
 def current_plan(args=None):
@@ -696,15 +926,30 @@ def cmd_validate(args):
         c.add(not stray, f"node{node} plan cpus are node-local",
               f"{compress(stray)} planned on node{node} but live elsewhere" if stray else "clean")
 
+    # The whole point of ranking nodes by NIC distance is lost if the plan guessed the
+    # wrong node: tier 0 then names cores that are a die crossing or a UPI hop away from
+    # the adapter, and every ranked list downstream is upside down.
+    loc = plan.get("nic_locality", {})
+    if loc:
+        iface = primary_iface()
+        node, src = nic_numa_node(iface)
+        if src != "device":
+            c.add(None, "primary NIC NUMA node",
+                  f"{iface or 'no iface'}: {src} - plan assumes node "
+                  f"{loc['nic_numa_node']}, unverifiable on this host")
+        else:
+            ok = node == loc["nic_numa_node"]
+            c.add(ok, "primary NIC NUMA node matches plan",
+                  f"{iface} on node {node}, plan assumes {loc['nic_numa_node']}"
+                  + ("" if ok else " - REPLAN with --live; the NIC-distance ranking is wrong"))
+
     # --- cgroup layer -----------------------------------------------------
     cg = "/sys/fs/cgroup"
     c.add(os.path.exists(f"{cg}/cgroup.controllers"), "cgroup v2 unified hierarchy")
     subtree = _read(f"{cg}/cgroup.subtree_control", "")
     c.add("cpuset" in subtree, "cpuset controller delegated", subtree)
 
-    hk_shared = compress(expand(plan["roles"]["housekeeping"]["cpus"])
-                         + expand(plan["roles"]["shared"]["cpus"]))
-    for slice_name, want in (("system.slice", hk_shared),
+    for slice_name, want in (("system.slice", plan["roles"]["housekeeping"]["cpus"]),
                              ("irqnet.slice", plan["roles"]["irqnet"]["cpus"]),
                              ("pulsar.slice", plan["roles"]["exclusive"]["cpus"])):
         have = _read(f"{cg}/{slice_name}/cpuset.cpus.effective", "")
@@ -838,6 +1083,11 @@ def main():
     src(p); p.add_argument("--plan"); p.add_argument("--policy")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(fn=cmd_layers)
+
+    p = sub.add_parser("nic", help="which NUMA node the primary NIC is on, and the node ranking")
+    src(p); p.add_argument("--plan"); p.add_argument("--policy")
+    p.add_argument("--iface", help="interface to inspect (default: first non-loopback)")
+    p.set_defaults(fn=cmd_nic)
 
     p = sub.add_parser("validate", help="verify the running host matches the plan")
     p.add_argument("--plan"); p.add_argument("-q", "--quiet", action="store_true",

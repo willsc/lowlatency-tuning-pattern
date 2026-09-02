@@ -105,21 +105,61 @@ for name in PROFILES:
         check("pulsar-exclusive.slice" not in sl and "pulsar-shared.slice" not in sl,
               f"{tag}: child pulsar slices should no longer be rendered")
         check(allowed(sl["irqnet.slice"]) == roles["irqnet"], f"{tag}: irqnet slice")
-        check(allowed(sl["system.slice.d/10-lowlatency.conf"])
-              == roles["housekeeping"] | roles["shared"],
-              f"{tag}: system.slice must be housekeeping + shared")
+        check(allowed(sl["system.slice.d/10-lowlatency.conf"]) == roles["housekeeping"],
+              f"{tag}: system.slice must be housekeeping only")
         check(allowed(sl["user.slice.d/10-lowlatency.conf"]) == roles["housekeeping"],
               f"{tag}: user.slice must stay housekeeping-only")
-        # Every core must be owned by exactly one of the three cpusets.
-        covered = (allowed(sl["system.slice.d/10-lowlatency.conf"])
-                   | allowed(sl["irqnet.slice"]) | allowed(sl["pulsar.slice"]))
-        check(covered == allcpus, f"{tag}: slices leave {len(allcpus - covered)} cores unowned")
+        # The shared role is deliberately in no cpuset: it is the one pool the kernel makes
+        # no guarantee about, so no slice may name it.
+        for key, body in sl.items():
+            check(not (allowed(body) & roles["shared"]),
+                  f"{tag}: {key} grants shared cores; no slice may name them")
+        # The managed cpusets must be disjoint and must cover everything except shared.
+        parts = [allowed(sl[k]) for k in
+                 ("system.slice.d/10-lowlatency.conf", "irqnet.slice", "pulsar.slice")]
+        for i, a in enumerate(parts):
+            for b in parts[i + 1:]:
+                check(not (a & b), f"{tag}: managed cpusets overlap")
+        covered = set().union(*parts)
+        check(covered == allcpus - roles["shared"],
+              f"{tag}: managed cpusets must cover every core but the shared pool "
+              f"({len(covered ^ (allcpus - roles['shared']))} cores off)")
 
         # cores.env round-trips
         env = dict(re.findall(r"^(\w+)=(.*)$", lltune.render_cores_env(plan), re.M))
         check(set(expand(env["EXCLUSIVE_CORES"])) == roles["exclusive"], f"{tag}: env EXCLUSIVE_CORES")
         check(set(expand(env["SHARED_CORES"])) == roles["shared"], f"{tag}: env SHARED_CORES")
         check(int(env["EXCLUSIVE_CORE_COUNT"]) == len(roles["exclusive"]), f"{tag}: env count")
+
+        # NIC locality: the ranking must be a permutation of the nodes, tier 0 must be the
+        # NIC's own node, and the ranked lists must re-assemble the flat pools.
+        loc = plan["nic_locality"]
+        app = plan["app"]
+        check(sorted(loc["node_order"]) == [n["node"] for n in plan["nodes"]],
+              f"{tag}: node_order is not a permutation of the NUMA nodes")
+        check(loc["tiers"][0]["nodes"] == [loc["nic_numa_node"]],
+              f"{tag}: tier 0 must be exactly the NIC's own node")
+        check([n for t in loc["tiers"] for n in t["nodes"]] == loc["node_order"],
+              f"{tag}: tiers do not concatenate back to node_order")
+        check(set(expand(",".join(app["exclusive_cores_ranked"]))) == roles["exclusive"],
+              f"{tag}: ranked exclusive lists != exclusive role")
+        check(set(expand(",".join(app["shared_cores_ranked"]))) == roles["shared"],
+              f"{tag}: ranked shared lists != shared role")
+        check(set(expand(",".join(app["exclusive_cores_by_tier"].values())))
+              == roles["exclusive"], f"{tag}: tiered exclusive lists != exclusive role")
+        check(app["nic_local_exclusive_core_count"] > 0,
+              f"{tag}: no exclusive core on the NIC's own node")
+        check(set(expand(app["nic_local_exclusive_cores"])) <= roles["exclusive"],
+              f"{tag}: NIC-local exclusive cores are not all exclusive")
+        check([int(x) for x in env["NUMA_NODE_ORDER"].split(",")] == loc["node_order"],
+              f"{tag}: env NUMA_NODE_ORDER != plan order")
+        check(env["EXCLUSIVE_CORES_RANKED"].strip('"').split("|")
+              == app["exclusive_cores_ranked"],
+              f"{tag}: env EXCLUSIVE_CORES_RANKED != plan")
+        # The file is sourced by scripts/*.sh, so every value must survive a shell.
+        for k, v in env.items():
+            check(("|" not in v) or (v.startswith('"') and v.endswith('"')),
+                  f"{tag}: env {k} carries an unquoted '|'")
 
 # range compression round-trip
 for spec_s in ["0", "0-3", "0-3,8", "1,3,5,7", "0-2,5,7-9,100-200"]:

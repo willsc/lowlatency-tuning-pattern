@@ -30,7 +30,7 @@ What the dry run shows, layer by layer:
 | `LAYER 1` | the GRUB file diff, then which planned arguments are missing from `/proc/cmdline` — this is what decides whether a reboot is required |
 | `LAYER 2` | the six unit files diffed, then the planned cpusets against the **live** ones in `/sys/fs/cgroup` |
 | `LAYER 3` | every runtime write `apply-runtime.sh` would make, with per-CPU paths collapsed |
-| `LAYER 4` | `cores.env`, `plan.json` and the sysctl file diffed |
+| `LAYER 4` | the application core contract, `plan.json` and the sysctl file diffed |
 | `SUMMARY` | counts, and whether a reboot is needed |
 
 ### Variants
@@ -151,35 +151,56 @@ Outliers here are firmware SMIs. Nothing in this repo will help; replace the ins
 
 ## Application integration
 
-The app reads `/etc/lowlatency/cores.env` and pins its own threads:
+The app is handed two core lists and the order to spend them in:
 
 ```sh
-source /etc/lowlatency/cores.env
-# EXCLUSIVE_CORES / SHARED_CORES / *_NODE<n> variants
+EXCLUSIVE_CORES            # == the isolcpus set; the latency path
+SHARED_CORES               # non-isolated, load-balanced; GC, JIT, admin, compaction
+NUMA_NODE_ORDER            # nodes ranked nearest-the-NIC first
+NIC_LOCAL_EXCLUSIVE_CORES  # tier 0: spend these before any other exclusive core
+EXCLUSIVE_CORES_TIER<n>    # the exclusive pool per NIC distance tier
+EXCLUSIVE_CORES_NODE<n>    # and per NUMA node
 ```
 
-Units must declare a slice — that is what grants access to the isolated CPUs:
+`./bin/lltune show` prints the whole map, and `./bin/lltune nic` prints the ranking and
+where it came from.
+
+### Which slice a unit belongs in
+
+The slice is the grant: moving a task into a cpuset rewrites its affinity mask, and that is
+the only way onto an `isolcpus`'d core.
+
+| Unit | Slice | Effective CPUs |
+|---|---|---|
+| the latency path | `Slice=pulsar.slice` | exclusive only |
+| agents, exporters, ordinary services | default (`system.slice`) | housekeeping only |
+| the app's shared-pool work | any slice `lltune` does not manage | everything but the isolated cores |
 
 ```ini
 # latency path -> isolated cores
 [Service]
 Slice=pulsar.slice
-EnvironmentFile=/etc/lowlatency/cores.env
 ```
 
-Units that should run on the shared pool need **no** `Slice=` at all — the default is
-`system.slice`, which carries housekeeping + shared:
+`system.slice` is confined to **housekeeping**, so a unit that needs the shared pool must
+*not* be left on the default. Give it a slice of its own that `lltune` renders no
+`AllowedCPUs` for — it then keeps init's inherited mask, which is every core except the
+isolated ones, and pins itself onto `SHARED_CORES` from there:
 
 ```ini
-# background / admin work -> shared cores, no Slice= needed
+# background / admin work -> shared cores
 [Service]
-EnvironmentFile=/etc/lowlatency/cores.env
+Slice=pulsar-support.slice
 ExecStart=/opt/pulsar/bin/pulsar-admin ...
 ```
 
-See `systemd/pulsar-broker.service.example`. `pulsar.slice` grants the isolated cores only;
-the shared pool comes from `system.slice`. For a JVM app, put the latency-critical IO
-threads on `EXCLUSIVE_CORES` and let GC/JIT threads float on `SHARED_CORES` — pinning GC
+A single process cannot span both pools through cgroups: a cpuset intersects with its
+parent's, so a unit under `pulsar.slice` is capped at the isolated cores whatever it asks
+for. Split the latency path and the shared work into two units. See
+`systemd/pulsar-broker.service.example`.
+
+For a JVM app, put the latency-critical IO threads on `EXCLUSIVE_CORES` — starting with
+`NIC_LOCAL_EXCLUSIVE_CORES` — and let GC/JIT threads float on `SHARED_CORES`. Pinning GC
 threads to isolated cores defeats the isolation, since a GC pause on an exclusive core is
 exactly the jitter you removed the tick to avoid.
 
@@ -211,6 +232,21 @@ Then check the profile agrees with reality:
 ```sh
 diff <(./bin/lltune topology --profile c8i-96xl) <(./bin/lltune topology --live)
 ```
+
+### And which NUMA node the primary NIC is on
+
+This is inferred on every multi-node shape — AWS publishes no PCIe root-complex map — and
+getting it wrong inverts the order the application is told to spend its exclusive cores in.
+
+```sh
+./bin/lltune nic --live     # adapter, its numa_node, the ACPI SLIT, and the ranking
+```
+
+Compare against the profile's `nic_numa_node` and correct it if they disagree, then re-plan.
+`lltune validate` fails on a mismatch between the installed plan and the live adapter. If
+the adapter reports `numa_node = -1` the firmware exposed no `_PXM`: the plan falls back to
+node 0, and the ranking should be treated as unproven until you have measured it by pinning
+a load generator to one node at a time.
 
 `lltune validate` also fails outright if the running host's NUMA node count disagrees with
 the installed plan, and checks that every CPU the plan assigned to a node is resident there.

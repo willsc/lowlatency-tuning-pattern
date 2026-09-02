@@ -15,6 +15,8 @@
     "sku_and_vcpus": "verified - AWS c8i instance page",
     "cpu_model": "verified - Intel Xeon 6975P-C, 192 physical / 384 logical, 960 MiB L3 total (480 per socket)",
     "numa_nodes": "SNC3 default on Xeon 6900P, confirmed as AWS's chosen mode. 2 sockets x 3 dies = 6 NUMA nodes.",
-    "cores_per_l3": "480 MiB per socket / 3 dies = 160 MiB per die; 96 cores / 3 = 32 cores per L3 domain."
-  }
+    "cores_per_l3": "480 MiB per socket / 3 dies = 160 MiB per die; 96 cores / 3 = 32 cores per L3 domain.",
+    "nic_numa_node": "ASSUMED node 0. Under SNC3 the PCIe root ports live on the I/O dies that flank the three compute dies, so firmware assigns the NIC to an EDGE domain of one socket - node 0 or node 2 if that socket is socket 0. Settle it with 'lltune nic --live'."
+  },
+  "nic_locality": "2 sockets x SNC3 - only ~1/6 of the machine is NIC-local"
 }

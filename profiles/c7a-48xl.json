@@ -14,6 +14,8 @@
   "confidence": {
     "sku_and_vcpus": "verified - AWS c7a instance page. metal-48xl is the ONLY c7a bare metal size.",
     "cpu_and_l3": "verified - EPYC 9R14, 192 physical cores, SMT off, 768 MiB L3 total / 32 MiB per CCX = 24 CCX of 8 cores",
-    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'."
-  }
+    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'.",
+    "nic_numa_node": "ASSUMED node 0. AWS publishes no PCIe root-complex map, and the socket the primary ENA hangs off is a platform wiring choice. Socket 0 is the convention. Settle it with 'lltune nic --live'."
+  },
+  "nic_locality": "2 sockets, 1 node each - the NIC is local to one socket, remote to the other"
 }

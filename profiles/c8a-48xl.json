@@ -14,6 +14,8 @@
   "confidence": {
     "sku_and_vcpus": "verified - AWS c8a instance page. c8a tops out at 48xl; there is no c8a.metal-96xl.",
     "cores_per_l3": "ASSUMED classic Zen 5 (8-core CCX). Confirm with --live.",
-    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'."
-  }
+    "numa_nodes": "ASSUMED NPS1. Confirm with 'lltune topology --live'.",
+    "nic_numa_node": "ASSUMED node 0. AWS publishes no PCIe root-complex map, and the socket the primary ENA hangs off is a platform wiring choice. Socket 0 is the convention. Settle it with 'lltune nic --live'."
+  },
+  "nic_locality": "2 sockets, 1 node each - the NIC is local to one socket, remote to the other"
 }
