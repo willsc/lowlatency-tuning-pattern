@@ -71,18 +71,19 @@ the mode AWS runs — exposes each die as its own NUMA domain with its own L3 sl
 four memory channels. A `c8i.metal-96xl` is therefore **six** NUMA nodes, not two.
 
 ```
-c8i.metal-96xl  —  2 sockets x 3 compute dies  =  6 NUMA domains
+c8i.metal-96xl  —  2 sockets × 3 compute dies  =  6 NUMA domains
 
-  ┌───────────────── socket 0 ─────────────────┐  ┌───────────────── socket 1 ─────────────────┐
-  │  node 0     │  node 1     │  node 2        │  │  node 3     │  node 4     │  node 5        │
-  │  die 0      │  die 1      │  die 2         │  │  die 0      │  die 1      │  die 2         │
-  │  32 cores   │  32 cores   │  32 cores      │  │  32 cores   │  32 cores   │  32 cores      │
-  │  160MiB L3  │  160MiB L3  │  160MiB L3     │  │  160MiB L3  │  160MiB L3  │  160MiB L3     │
-  │  4 mem ch   │  4 mem ch   │  4 mem ch      │  │  4 mem ch   │  4 mem ch   │  4 mem ch      │
-  │  cpu 0-31   │  cpu 32-63  │  cpu 64-95     │  │  cpu 96-127 │  cpu128-159 │  cpu160-191    │
-  └─────────────┴─────────────┴────────────────┘  └─────────────┴─────────────┴────────────────┘
-         ▲                                  UPI
-         └── NIC attaches here (one die, one socket)
+┌─────────── socket 0 ───────────┐         ┌─────────── socket 1 ───────────┐
+│node 0    │node 1    │node 2    │         │node 3    │node 4    │node 5    │
+│die 0     │die 1     │die 2     │         │die 0     │die 1     │die 2     │
+│32 cores  │32 cores  │32 cores  │         │32 cores  │32 cores  │32 cores  │
+│160MiB L3 │160MiB L3 │160MiB L3 │         │160MiB L3 │160MiB L3 │160MiB L3 │
+│4 mem ch  │4 mem ch  │4 mem ch  │         │4 mem ch  │4 mem ch  │4 mem ch  │
+│cpu 0-31  │cpu 32-63 │cpu 64-95 │         │cpu96-127 │cpu128-159│cpu160-191│
+└──┬───────┴──────────┴──────────┘   UPI   └──────────┴──────────┴──────────┘
+   │
+   └── the primary NIC attaches to ONE die on ONE socket, so only 32 of
+       the 192 cores are in its NUMA domain
 ```
 
 The plan reserves housekeeping and IRQ cores **per node**, so the node count directly sets the

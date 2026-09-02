@@ -53,25 +53,21 @@ because a wrong NIC node turns the whole ranking upside down.
 ## The layers
 
 ```
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores, shared_cores, and the NUMA node order to spend them in  |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity, ENA queue count, XPS, unbound workqueues, governor, THP    |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice = exclusive   irqnet.slice = irqnet   system.slice = hk     |
-|   shared_cores are in NO cpuset - the app pins itself onto them            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus = nohz_full = rcu_nocbs, and irqaffinity for everything else    |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE                    the cores the metal shape actually has |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores, shared_cores, and the NUMA node order to spend them in │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    IRQ affinity, ENA queue count, XPS, unbound workqueues, governor, THP   │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice = exclusive    irqnet.slice = irqnet    system.slice = hk  │
+│    shared_cores are named by no cpuset; the app pins itself onto them      │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus = nohz_full = rcu_nocbs, and irqaffinity for everything else   │
+├── LAYER 0   the machine ───────────────────────────────────────────────────┤
+│    the cores the metal shape actually has                                  │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Four layers, one set of cores. The constraint between layers 2 and 1 is the only hard one:
@@ -80,11 +76,13 @@ keep serving traffic while its tail latency doubled. That is why all four are re
 one `plan.json`.
 
 **[`docs/ARCHITECTURES.md`](docs/ARCHITECTURES.md) has this diagram for each of the seven
-metal shapes**, carrying that shape's real core allocation and the actual values every
-layer installs — kernel arguments, cgroup cpusets, runtime pinning targets and the
-application's core contract, plus the per-NUMA-node breakdown ordered by distance from the
-NIC. The diagrams are plain text, and there is a Confluence-markup copy of the whole
-document in [`docs/confluence/`](docs/confluence/).
+metal shapes**, carrying that shape's real values — and two more besides: a segmented core
+map showing where each role's cut actually falls on every NUMA node, and the exclusive pool
+drawn as a distance axis from the primary NIC, with the tier-0 column sized to show how
+little of the machine is genuinely NIC-local.
+
+The diagrams are plain text, drawn to 78 columns, and there is a Confluence-markup copy of
+the whole document in [`docs/confluence/`](docs/confluence/).
 
 ## Why it is built this way
 

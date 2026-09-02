@@ -28,7 +28,12 @@ INTRO = (
     "application.")
 
 READING = (
-    "Read each diagram downward. Layer 4 is what the application sees; layer 0 is the "
+    "Up to three diagrams per shape - the NIC distance axis is only drawn where there is "
+    "more than one NUMA node to rank. All of them are 78 columns wide and rendered from "
+    "the same plan the installer uses.")
+
+READING_2 = (
+    "Read the layer stack downward. Layer 4 is what the application sees; layer 0 is the "
     "machine underneath. The constraint drawn between layers 2 and 1 is the only hard one "
     "in the design - a pulsar.slice that disagreed with isolcpus would keep serving "
     "traffic while its tail latency doubled, and nothing at run time would say so.")
@@ -107,8 +112,19 @@ def build(doc):
     doc.para(INTRO)
     doc.toc()
 
-    doc.h(2, "How to read a diagram")
+    doc.h(2, "How to read the diagrams")
     doc.para(READING)
+    doc.table(
+        ["Diagram", "What it shows", "What to check in it"],
+        [["the layer stack", "the four layers, with this shape's real values in each",
+          "that pulsar.slice and isolcpus carry the same list"],
+         ["the core map", "one segmented bar per NUMA node, ordered nearest-NIC-first; "
+                          "the dividers are where each role's cut actually falls",
+          "that every node has its own housekeeping and IRQ cores"],
+         ["the NIC distance axis", "the exclusive pool split by distance from the primary "
+                                   "NIC, with each column sized by how many cores it holds",
+          "how narrow the NIC-local column is - that is the real latency budget"]])
+    doc.para(READING_2)
     doc.para("The four layers, and what each one is:")
     doc.table(
         ["Layer", "Mechanism", "When it takes effect"],
@@ -183,6 +199,9 @@ def build(doc):
                     title=f"{name} - the four configuration layers")
         doc.diagram(textdiag.core_map(plan),
                     title=f"{name} - core map, NUMA nodes ordered by distance from the NIC")
+        axis = textdiag.nic_axis(plan)
+        if axis:
+            doc.diagram(axis, title=f"{name} - the exclusive pool, ranked by NIC distance")
 
         doc.table(
             ["Role", "CPUs", "Count", "Where it lives"],

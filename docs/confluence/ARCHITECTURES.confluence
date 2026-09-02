@@ -8,9 +8,16 @@ One layered diagram per supported metal shape, each carrying that shape's real c
 
 {toc:maxLevel=2|minLevel=2}
 
-h2. How to read a diagram
+h2. How to read the diagrams
 
-Read each diagram downward. Layer 4 is what the application sees; layer 0 is the machine underneath. The constraint drawn between layers 2 and 1 is the only hard one in the design - a pulsar.slice that disagreed with isolcpus would keep serving traffic while its tail latency doubled, and nothing at run time would say so.
+Up to three diagrams per shape - the NIC distance axis is only drawn where there is more than one NUMA node to rank. All of them are 78 columns wide and rendered from the same plan the installer uses.
+
+||Diagram||What it shows||What to check in it||
+|the layer stack|the four layers, with this shape's real values in each|that pulsar.slice and isolcpus carry the same list|
+|the core map|one segmented bar per NUMA node, ordered nearest-NIC-first; the dividers are where each role's cut actually falls|that every node has its own housekeeping and IRQ cores|
+|the NIC distance axis|the exclusive pool split by distance from the primary NIC, with each column sized by how many cores it holds|how narrow the NIC-local column is - that is the real latency budget|
+
+Read the layer stack downward. Layer 4 is what the application sees; layer 0 is the machine underneath. The constraint drawn between layers 2 and 1 is the only hard one in the design - a pulsar.slice that disagreed with isolcpus would keep serving traffic while its tail latency doubled, and nothing at run time would say so.
 
 The four layers, and what each one is:
 
@@ -79,43 +86,44 @@ h2. c7i-24xl
 c7i.metal-24xl - Intel Sapphire Rapids - 1 socket x 48 cores - 96 vCPU to 48 usable - 1 NUMA node (SNC disabled) - L3 domain 48 cores
 
 {noformat:title=c7i-24xl - the four configuration layers}
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores  11-47                                                   |
-|   shared_cores     4-10                                                    |
-|   NIC-local first  node0                                                   |
-|   spend 11-47 (37 cpu) before any other exclusive core                     |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity     0-3                                                     |
-|   ENA combined queues   2  (clamped to the irqnet core count)              |
-|   workqueue mask   0-10                                                    |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice     11-47                                                   |
-|   irqnet.slice     2-3                                                     |
-|   system.slice     0-1                                                     |
-|   shared_cores     4-10                                                    |
-|                    in NO cpuset - reached by inherited affinity            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus         11-47                                                   |
-|   also nohz_full and rcu_nocbs, both the same list                         |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE   c7i.metal-24xl                    Intel Sapphire Rapids |
-|   1 socket(s) x 48 cores   1 NUMA node(s) (SNC disabled)   L3 domain 48    |
-|   primary NIC on node 0  (the only node there is)                          |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores     11-47                                        37 cpu │
+│    shared_cores        4-10                                          7 cpu │
+│                                                                            │
+│    spend in this order node0                                               │
+│      tier 0, NIC-local 11-47                                        37 cpu │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    irqaffinity         0-3                                                 │
+│    workqueue mask      0-10                                                │
+│    ENA queues          2                  clamped to the irqnet core count │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice        11-47                                        37 cpu │
+│    irqnet.slice        2-3                                           2 cpu │
+│    system.slice        0-1                                           2 cpu │
+│    shared_cores        4-10                                          7 cpu │
+│                        named by no cpuset; reached by inherited affinity   │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus            11-47                                               │
+│    nohz_full           11-47                                               │
+│    rcu_nocbs           11-47                                               │
+├── LAYER 0   the machine ───────────────────────────────── c7i.metal-24xl ──┤
+│    Intel Sapphire Rapids                                                   │
+│    1 socket(s) × 48 cores   ·   1 NUMA node(s) (SNC disabled)   ·   L3 dom │
+│    primary NIC on node 0   (the only node there is)                        │
+└────────────────────────────────────────────────────────────────────────────┘
 {noformat}
 
 {noformat:title=c7i-24xl - core map, NUMA nodes ordered by distance from the NIC}
-  node0   tier 0  NIC-local                                       48 cores
-  [HHHIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
+  node0  ·  tier 0  ·  NIC-local                       48 cores  ·  cpu 0-47
+  ┌───┬───┬──────────┬─────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴──────────┴─────────────────────────────────────────────────────┘
+   H 0-1  I 2-3  S 4-10  E 11-47
 
-  H housekeeping   I irqnet   S shared (in no cpuset)   E exclusive (isolated)
+  H housekeeping    I irqnet    S shared (in no cpuset)    E exclusive (isolated)
 {noformat}
 
 ||Role||CPUs||Count||Where it lives||
@@ -173,45 +181,62 @@ h2. c7i-48xl
 c7i.metal-48xl - Intel Sapphire Rapids - 2 sockets x 48 cores - 192 vCPU to 96 usable - 2 NUMA nodes (SNC disabled) - L3 domain 48 cores
 
 {noformat:title=c7i-48xl - the four configuration layers}
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores  11-47,59-95                                             |
-|   shared_cores     4-10,52-58                                              |
-|   NIC-local first  node0 -> node1                                          |
-|   spend 11-47 (37 cpu) before any other exclusive core                     |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity     0-3,48-51                                               |
-|   ENA combined queues   4  (clamped to the irqnet core count)              |
-|   workqueue mask   0-10,48-58                                              |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice     11-47,59-95                                             |
-|   irqnet.slice     2-3,50-51                                               |
-|   system.slice     0-1,48-49                                               |
-|   shared_cores     4-10,52-58                                              |
-|                    in NO cpuset - reached by inherited affinity            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus         11-47,59-95                                             |
-|   also nohz_full and rcu_nocbs, both the same list                         |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE   c7i.metal-48xl                    Intel Sapphire Rapids |
-|   2 socket(s) x 48 cores   2 NUMA node(s) (SNC disabled)   L3 domain 48    |
-|   primary NIC on node 0  (inferred - confirm with lltune nic --live)       |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores     11-47,59-95                                  74 cpu │
+│    shared_cores        4-10,52-58                                   14 cpu │
+│                                                                            │
+│    spend in this order node0 > node1                                       │
+│      tier 0, NIC-local 11-47                                        37 cpu │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    irqaffinity         0-3,48-51                                           │
+│    workqueue mask      0-10,48-58                                          │
+│    ENA queues          4                  clamped to the irqnet core count │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice        11-47,59-95                                  74 cpu │
+│    irqnet.slice        2-3,50-51                                     4 cpu │
+│    system.slice        0-1,48-49                                     4 cpu │
+│    shared_cores        4-10,52-58                                   14 cpu │
+│                        named by no cpuset; reached by inherited affinity   │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus            11-47,59-95                                         │
+│    nohz_full           11-47,59-95                                         │
+│    rcu_nocbs           11-47,59-95                                         │
+├── LAYER 0   the machine ───────────────────────────────── c7i.metal-48xl ──┤
+│    Intel Sapphire Rapids                                                   │
+│    2 socket(s) × 48 cores   ·   2 NUMA node(s) (SNC disabled)   ·   L3 dom │
+│    primary NIC on node 0   (inferred · confirm with lltune nic --live)     │
+└────────────────────────────────────────────────────────────────────────────┘
 {noformat}
 
 {noformat:title=c7i-48xl - core map, NUMA nodes ordered by distance from the NIC}
-  node0   tier 0  NIC-local                                       48 cores
-  [HHHIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node1   tier 1  remote socket                                   48 cores
-  [HHHIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
+  node0  ·  tier 0  ·  NIC-local                       48 cores  ·  cpu 0-47
+  ┌───┬───┬──────────┬─────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴──────────┴─────────────────────────────────────────────────────┘
+   H 0-1  I 2-3  S 4-10  E 11-47
 
-  H housekeeping   I irqnet   S shared (in no cpuset)   E exclusive (isolated)
+  node1  ·  tier 1  ·  remote socket                  48 cores  ·  cpu 48-95
+  ┌───┬───┬──────────┬─────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴──────────┴─────────────────────────────────────────────────────┘
+   H 48-49  I 50-51  S 52-58  E 59-95
+
+  H housekeeping    I irqnet    S shared (in no cpuset)    E exclusive (isolated)
+{noformat}
+
+{noformat:title=c7i-48xl - the exclusive pool, ranked by NIC distance}
+  primary NIC on node 0
+  │
+┌─┴────────────────────────────────────┬─────────────────────────────────────┐
+│ tier 0                               │ tier 1                              │
+│ NIC-local                            │ remote socket                       │
+│ node0                                │ node1                               │
+│ 37 exclusive cpu                     │ 37 exclusive cpu                    │
+└──────────────────────────────────────┴─────────────────────────────────────┘
+  nearest                                                             furthest
 {noformat}
 
 ||Role||CPUs||Count||Where it lives||
@@ -271,47 +296,68 @@ h2. c8i-48xl
 c8i.metal-48xl - Intel Xeon 6 (Granite Rapids) - 1 socket x 96 cores - 192 vCPU to 96 usable - 3 NUMA nodes (SNC3) - L3 domain 32 cores
 
 {noformat:title=c8i-48xl - the four configuration layers}
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores  9-31,41-63,73-95                                        |
-|   shared_cores     4-8,36-40,68-72                                         |
-|   NIC-local first  node0 -> node1 -> node2                                 |
-|   spend 9-31 (23 cpu) before any other exclusive core                      |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity     0-3,32-35,64-67                                         |
-|   ENA combined queues   6  (clamped to the irqnet core count)              |
-|   workqueue mask   0-8,32-40,64-72                                         |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice     9-31,41-63,73-95                                        |
-|   irqnet.slice     2-3,34-35,66-67                                         |
-|   system.slice     0-1,32-33,64-65                                         |
-|   shared_cores     4-8,36-40,68-72                                         |
-|                    in NO cpuset - reached by inherited affinity            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus         9-31,41-63,73-95                                        |
-|   also nohz_full and rcu_nocbs, both the same list                         |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE   c8i.metal-48xl            Intel Xeon 6 (Granite Rapids) |
-|   1 socket(s) x 96 cores   3 NUMA node(s) (SNC3)   L3 domain 32            |
-|   primary NIC on node 0  (inferred - confirm with lltune nic --live)       |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores     9-31,41-63,73-95                             69 cpu │
+│    shared_cores        4-8,36-40,68-72                              15 cpu │
+│                                                                            │
+│    spend in this order node0 > node1 > node2                               │
+│      tier 0, NIC-local 9-31                                         23 cpu │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    irqaffinity         0-3,32-35,64-67                                     │
+│    workqueue mask      0-8,32-40,64-72                                     │
+│    ENA queues          6                  clamped to the irqnet core count │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice        9-31,41-63,73-95                             69 cpu │
+│    irqnet.slice        2-3,34-35,66-67                               6 cpu │
+│    system.slice        0-1,32-33,64-65                               6 cpu │
+│    shared_cores        4-8,36-40,68-72                              15 cpu │
+│                        named by no cpuset; reached by inherited affinity   │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus            9-31,41-63,73-95                                    │
+│    nohz_full           9-31,41-63,73-95                                    │
+│    rcu_nocbs           9-31,41-63,73-95                                    │
+├── LAYER 0   the machine ───────────────────────────────── c8i.metal-48xl ──┤
+│    Intel Xeon 6 (Granite Rapids)                                           │
+│    1 socket(s) × 96 cores   ·   3 NUMA node(s) (SNC3)   ·   L3 domain 32   │
+│    primary NIC on node 0   (inferred · confirm with lltune nic --live)     │
+└────────────────────────────────────────────────────────────────────────────┘
 {noformat}
 
 {noformat:title=c8i-48xl - core map, NUMA nodes ordered by distance from the NIC}
-  node0   tier 0  NIC-local                                       32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node1   tier 1  same socket, remote die                         32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node2   tier 1  same socket, remote die                         32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
+  node0  ·  tier 0  ·  NIC-local                       32 cores  ·  cpu 0-31
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 0-1  I 2-3  S 4-8   E 9-31
 
-  H housekeeping   I irqnet   S shared (in no cpuset)   E exclusive (isolated)
+  node1  ·  tier 1  ·  same socket, remote die        32 cores  ·  cpu 32-63
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 32-33  I 34-35  S 36-40  E 41-63
+
+  node2  ·  tier 1  ·  same socket, remote die        32 cores  ·  cpu 64-95
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 64-65  I 66-67  S 68-72  E 73-95
+
+  H housekeeping    I irqnet    S shared (in no cpuset)    E exclusive (isolated)
+{noformat}
+
+{noformat:title=c8i-48xl - the exclusive pool, ranked by NIC distance}
+  primary NIC on node 0
+  │
+┌─┴───────────────────────────┬──────────────────────────────────────────────┐
+│ tier 0                      │ tier 1                                       │
+│ NIC-local                   │ same socket, remote die                      │
+│ node0                       │ node1, node2                                 │
+│ 23 exclusive cpu            │ 46 exclusive cpu                             │
+└─────────────────────────────┴──────────────────────────────────────────────┘
+  nearest                                                             furthest
 {noformat}
 
 ||Role||CPUs||Count||Where it lives||
@@ -368,53 +414,86 @@ h2. c8i-96xl
 c8i.metal-96xl - Intel Xeon 6975P-C - 2 sockets x 96 cores - 384 vCPU to 192 usable - 6 NUMA nodes (SNC3) - L3 domain 32 cores
 
 {noformat:title=c8i-96xl - the four configuration layers}
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores  9-31,41-63,73-95,105-127,137-159,169-191                |
-|   shared_cores     4-8,36-40,68-72,100-104,132-136,164-168                 |
-|   NIC-local first  node0 -> node1 -> node2 -> node3 -> node4 -> node5      |
-|   spend 9-31 (23 cpu) before any other exclusive core                      |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity     0-3,32-35,64-67,96-99,128-131,160-163                   |
-|   ENA combined queues   12  (clamped to the irqnet core count)             |
-|   workqueue mask   0-8,32-40,64-72,96-104,128-136,160-168                  |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice     9-31,41-63,73-95,105-127,137-159,169-191                |
-|   irqnet.slice     2-3,34-35,66-67,98-99,130-131,162-163                   |
-|   system.slice     0-1,32-33,64-65,96-97,128-129,160-161                   |
-|   shared_cores     4-8,36-40,68-72,100-104,132-136,164-168                 |
-|                    in NO cpuset - reached by inherited affinity            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus         9-31,41-63,73-95,105-127,137-159,169-191                |
-|   also nohz_full and rcu_nocbs, both the same list                         |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE   c8i.metal-96xl                       Intel Xeon 6975P-C |
-|   2 socket(s) x 96 cores   6 NUMA node(s) (SNC3)   L3 domain 32            |
-|   primary NIC on node 0  (inferred - confirm with lltune nic --live)       |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores     9-31,41-63,73-95,105-127,137-159,169-191    138 cpu │
+│    shared_cores        4-8,36-40,68-72,100-104,132-136,164-168      30 cpu │
+│                                                                            │
+│    spend in this order node0 > node1 > node2 > node3 > node4 > node5       │
+│      tier 0, NIC-local 9-31                                         23 cpu │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    irqaffinity         0-3,32-35,64-67,96-99,128-131,160-163               │
+│    workqueue mask      0-8,32-40,64-72,96-104,128-136,160-168              │
+│    ENA queues          12                 clamped to the irqnet core count │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice        9-31,41-63,73-95,105-127,137-159,169-191    138 cpu │
+│    irqnet.slice        2-3,34-35,66-67,98-99,130-131,162-163        12 cpu │
+│    system.slice        0-1,32-33,64-65,96-97,128-129,160-161        12 cpu │
+│    shared_cores        4-8,36-40,68-72,100-104,132-136,164-168      30 cpu │
+│                        named by no cpuset; reached by inherited affinity   │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus            9-31,41-63,73-95,105-127,137-159,169-191            │
+│    nohz_full           9-31,41-63,73-95,105-127,137-159,169-191            │
+│    rcu_nocbs           9-31,41-63,73-95,105-127,137-159,169-191            │
+├── LAYER 0   the machine ───────────────────────────────── c8i.metal-96xl ──┤
+│    Intel Xeon 6975P-C                                                      │
+│    2 socket(s) × 96 cores   ·   6 NUMA node(s) (SNC3)   ·   L3 domain 32   │
+│    primary NIC on node 0   (inferred · confirm with lltune nic --live)     │
+└────────────────────────────────────────────────────────────────────────────┘
 {noformat}
 
 {noformat:title=c8i-96xl - core map, NUMA nodes ordered by distance from the NIC}
-  node0   tier 0  NIC-local                                       32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node1   tier 1  same socket, remote die                         32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node2   tier 1  same socket, remote die                         32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node3   tier 2  remote socket                                   32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node4   tier 2  remote socket                                   32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node5   tier 2  remote socket                                   32 cores
-  [HHHHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
+  node0  ·  tier 0  ·  NIC-local                       32 cores  ·  cpu 0-31
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 0-1  I 2-3  S 4-8   E 9-31
 
-  H housekeeping   I irqnet   S shared (in no cpuset)   E exclusive (isolated)
+  node1  ·  tier 1  ·  same socket, remote die        32 cores  ·  cpu 32-63
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 32-33  I 34-35  S 36-40  E 41-63
+
+  node2  ·  tier 1  ·  same socket, remote die        32 cores  ·  cpu 64-95
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 64-65  I 66-67  S 68-72  E 73-95
+
+  node3  ·  tier 2  ·  remote socket                 32 cores  ·  cpu 96-127
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 96-97  I 98-99  S 100-104  E 105-127
+
+  node4  ·  tier 2  ·  remote socket                32 cores  ·  cpu 128-159
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 128-129  I 130-131  S 132-136  E 137-159
+
+  node5  ·  tier 2  ·  remote socket                32 cores  ·  cpu 160-191
+  ┌────┬────┬───────────┬──────────────────────────────────────────────────┐
+  │HHHH│IIII│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └────┴────┴───────────┴──────────────────────────────────────────────────┘
+   H 160-161  I 162-163  S 164-168  E 169-191
+
+  H housekeeping    I irqnet    S shared (in no cpuset)    E exclusive (isolated)
+{noformat}
+
+{noformat:title=c8i-96xl - the exclusive pool, ranked by NIC distance}
+  primary NIC on node 0
+  │
+┌─┴──────────────────┬────────────────────────────┬──────────────────────────┐
+│ tier 0             │ tier 1                     │ tier 2                   │
+│ NIC-local          │ same socket, remote die    │ remote socket            │
+│ node0              │ node1, node2               │ node3, node4, node5      │
+│ 23 exclusive cpu   │ 46 exclusive cpu           │ 69 exclusive cpu         │
+└────────────────────┴────────────────────────────┴──────────────────────────┘
+  nearest                                                             furthest
 {noformat}
 
 ||Role||CPUs||Count||Where it lives||
@@ -475,45 +554,62 @@ h2. c7a-48xl
 c7a.metal-48xl - AMD EPYC 9R14 (Genoa) - 2 sockets x 96 cores - 192 vCPU to 192 usable - 2 NUMA nodes (NPS1) - L3 domain 8 cores
 
 {noformat:title=c7a-48xl - the four configuration layers}
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores  24-95,120-191                                           |
-|   shared_cores     9-23,105-119                                            |
-|   NIC-local first  node0 -> node1                                          |
-|   spend 24-95 (72 cpu) before any other exclusive core                     |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity     0-8,96-104                                              |
-|   ENA combined queues   10  (clamped to the irqnet core count)             |
-|   workqueue mask   0-23,96-119                                             |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice     24-95,120-191                                           |
-|   irqnet.slice     4-8,100-104                                             |
-|   system.slice     0-3,96-99                                               |
-|   shared_cores     9-23,105-119                                            |
-|                    in NO cpuset - reached by inherited affinity            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus         24-95,120-191                                           |
-|   also nohz_full and rcu_nocbs, both the same list                         |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE   c7a.metal-48xl                    AMD EPYC 9R14 (Genoa) |
-|   2 socket(s) x 96 cores   2 NUMA node(s) (NPS1)   L3 domain 8             |
-|   primary NIC on node 0  (inferred - confirm with lltune nic --live)       |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores     24-95,120-191                               144 cpu │
+│    shared_cores        9-23,105-119                                 30 cpu │
+│                                                                            │
+│    spend in this order node0 > node1                                       │
+│      tier 0, NIC-local 24-95                                        72 cpu │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    irqaffinity         0-8,96-104                                          │
+│    workqueue mask      0-23,96-119                                         │
+│    ENA queues          10                 clamped to the irqnet core count │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice        24-95,120-191                               144 cpu │
+│    irqnet.slice        4-8,100-104                                  10 cpu │
+│    system.slice        0-3,96-99                                     8 cpu │
+│    shared_cores        9-23,105-119                                 30 cpu │
+│                        named by no cpuset; reached by inherited affinity   │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus            24-95,120-191                                       │
+│    nohz_full           24-95,120-191                                       │
+│    rcu_nocbs           24-95,120-191                                       │
+├── LAYER 0   the machine ───────────────────────────────── c7a.metal-48xl ──┤
+│    AMD EPYC 9R14 (Genoa)                                                   │
+│    2 socket(s) × 96 cores   ·   2 NUMA node(s) (NPS1)   ·   L3 domain 8    │
+│    primary NIC on node 0   (inferred · confirm with lltune nic --live)     │
+└────────────────────────────────────────────────────────────────────────────┘
 {noformat}
 
 {noformat:title=c7a-48xl - core map, NUMA nodes ordered by distance from the NIC}
-  node0   tier 0  NIC-local                                       96 cores
-  [HHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node1   tier 1  remote socket                                   96 cores
-  [HHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
+  node0  ·  tier 0  ·  NIC-local                       96 cores  ·  cpu 0-95
+  ┌───┬───┬───────────┬────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴───────────┴────────────────────────────────────────────────────┘
+   H 0-3  I 4-8  S 9-23  E 24-95
 
-  H housekeeping   I irqnet   S shared (in no cpuset)   E exclusive (isolated)
+  node1  ·  tier 1  ·  remote socket                 96 cores  ·  cpu 96-191
+  ┌───┬───┬───────────┬────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴───────────┴────────────────────────────────────────────────────┘
+   H 96-99  I 100-104  S 105-119  E 120-191
+
+  H housekeeping    I irqnet    S shared (in no cpuset)    E exclusive (isolated)
+{noformat}
+
+{noformat:title=c7a-48xl - the exclusive pool, ranked by NIC distance}
+  primary NIC on node 0
+  │
+┌─┴────────────────────────────────────┬─────────────────────────────────────┐
+│ tier 0                               │ tier 1                              │
+│ NIC-local                            │ remote socket                       │
+│ node0                                │ node1                               │
+│ 72 exclusive cpu                     │ 72 exclusive cpu                    │
+└──────────────────────────────────────┴─────────────────────────────────────┘
+  nearest                                                             furthest
 {noformat}
 
 ||Role||CPUs||Count||Where it lives||
@@ -571,43 +667,44 @@ h2. c8a-24xl
 c8a.metal-24xl - AMD EPYC Turin - 1 socket x 96 cores - 96 vCPU to 96 usable - 1 NUMA node (NPS1) - L3 domain 8 cores
 
 {noformat:title=c8a-24xl - the four configuration layers}
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores  24-95                                                   |
-|   shared_cores     9-23                                                    |
-|   NIC-local first  node0                                                   |
-|   spend 24-95 (72 cpu) before any other exclusive core                     |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity     0-8                                                     |
-|   ENA combined queues   5  (clamped to the irqnet core count)              |
-|   workqueue mask   0-23                                                    |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice     24-95                                                   |
-|   irqnet.slice     4-8                                                     |
-|   system.slice     0-3                                                     |
-|   shared_cores     9-23                                                    |
-|                    in NO cpuset - reached by inherited affinity            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus         24-95                                                   |
-|   also nohz_full and rcu_nocbs, both the same list                         |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE   c8a.metal-24xl                           AMD EPYC Turin |
-|   1 socket(s) x 96 cores   1 NUMA node(s) (NPS1)   L3 domain 8             |
-|   primary NIC on node 0  (the only node there is)                          |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores     24-95                                        72 cpu │
+│    shared_cores        9-23                                         15 cpu │
+│                                                                            │
+│    spend in this order node0                                               │
+│      tier 0, NIC-local 24-95                                        72 cpu │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    irqaffinity         0-8                                                 │
+│    workqueue mask      0-23                                                │
+│    ENA queues          5                  clamped to the irqnet core count │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice        24-95                                        72 cpu │
+│    irqnet.slice        4-8                                           5 cpu │
+│    system.slice        0-3                                           4 cpu │
+│    shared_cores        9-23                                         15 cpu │
+│                        named by no cpuset; reached by inherited affinity   │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus            24-95                                               │
+│    nohz_full           24-95                                               │
+│    rcu_nocbs           24-95                                               │
+├── LAYER 0   the machine ───────────────────────────────── c8a.metal-24xl ──┤
+│    AMD EPYC Turin                                                          │
+│    1 socket(s) × 96 cores   ·   1 NUMA node(s) (NPS1)   ·   L3 domain 8    │
+│    primary NIC on node 0   (the only node there is)                        │
+└────────────────────────────────────────────────────────────────────────────┘
 {noformat}
 
 {noformat:title=c8a-24xl - core map, NUMA nodes ordered by distance from the NIC}
-  node0   tier 0  NIC-local                                       96 cores
-  [HHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
+  node0  ·  tier 0  ·  NIC-local                       96 cores  ·  cpu 0-95
+  ┌───┬───┬───────────┬────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴───────────┴────────────────────────────────────────────────────┘
+   H 0-3  I 4-8  S 9-23  E 24-95
 
-  H housekeeping   I irqnet   S shared (in no cpuset)   E exclusive (isolated)
+  H housekeeping    I irqnet    S shared (in no cpuset)    E exclusive (isolated)
 {noformat}
 
 ||Role||CPUs||Count||Where it lives||
@@ -664,45 +761,62 @@ h2. c8a-48xl
 c8a.metal-48xl - AMD EPYC Turin - 2 sockets x 96 cores - 192 vCPU to 192 usable - 2 NUMA nodes (NPS1) - L3 domain 8 cores
 
 {noformat:title=c8a-48xl - the four configuration layers}
-+============================================================================+
-| LAYER 4  APPLICATION CORE CONTRACT             no reboot; read at start-up |
-|   exclusive_cores  24-95,120-191                                           |
-|   shared_cores     9-23,105-119                                            |
-|   NIC-local first  node0 -> node1                                          |
-|   spend 24-95 (72 cpu) before any other exclusive core                     |
-+----------------------------------------------------------------------------+
-| LAYER 3  RUNTIME PINNING                lltune-runtime.service, every boot |
-|   IRQ affinity     0-8,96-104                                              |
-|   ENA combined queues   10  (clamped to the irqnet core count)             |
-|   workqueue mask   0-23,96-119                                             |
-+----------------------------------------------------------------------------+
-| LAYER 2  CGROUP v2 SLICES                         daemon-reload; immediate |
-|   pulsar.slice     24-95,120-191                                           |
-|   irqnet.slice     4-8,100-104                                             |
-|   system.slice     0-3,96-99                                               |
-|   shared_cores     9-23,105-119                                            |
-|                    in NO cpuset - reached by inherited affinity            |
-+----------------------------------------------------------------------------+
-|    ^   pulsar.slice AllowedCPUs MUST equal isolcpus. Nothing checks        |
-|    |   it at run time, so both are rendered from one plan field.           |
-+----------------------------------------------------------------------------+
-| LAYER 1  BOOT ISOLATION                          grub.d; REQUIRES A REBOOT |
-|   isolcpus         24-95,120-191                                           |
-|   also nohz_full and rcu_nocbs, both the same list                         |
-+----------------------------------------------------------------------------+
-| LAYER 0  MACHINE   c8a.metal-48xl                           AMD EPYC Turin |
-|   2 socket(s) x 96 cores   2 NUMA node(s) (NPS1)   L3 domain 8             |
-|   primary NIC on node 0  (inferred - confirm with lltune nic --live)       |
-+============================================================================+
+┌── LAYER 4   application core contract ───────────── start-up · no reboot ──┐
+│    exclusive_cores     24-95,120-191                               144 cpu │
+│    shared_cores        9-23,105-119                                 30 cpu │
+│                                                                            │
+│    spend in this order node0 > node1                                       │
+│      tier 0, NIC-local 24-95                                        72 cpu │
+├── LAYER 3   runtime pinning ──────────────── every boot · lltune-runtime ──┤
+│    irqaffinity         0-8,96-104                                          │
+│    workqueue mask      0-23,96-119                                         │
+│    ENA queues          10                 clamped to the irqnet core count │
+├── LAYER 2   cgroup v2 slices ───────────────── daemon-reload · immediate ──┤
+│    pulsar.slice        24-95,120-191                               144 cpu │
+│    irqnet.slice        4-8,100-104                                  10 cpu │
+│    system.slice        0-3,96-99                                     8 cpu │
+│    shared_cores        9-23,105-119                                 30 cpu │
+│                        named by no cpuset; reached by inherited affinity   │
+├────────────────────────────────────────────────────────────────────────────┤
+│    pulsar.slice AllowedCPUs  ════════════  isolcpus                        │
+│    identical by construction · nothing checks it at run time               │
+├── LAYER 1   boot isolation ────────────────── grub.d · REQUIRES A REBOOT ──┤
+│    isolcpus            24-95,120-191                                       │
+│    nohz_full           24-95,120-191                                       │
+│    rcu_nocbs           24-95,120-191                                       │
+├── LAYER 0   the machine ───────────────────────────────── c8a.metal-48xl ──┤
+│    AMD EPYC Turin                                                          │
+│    2 socket(s) × 96 cores   ·   2 NUMA node(s) (NPS1)   ·   L3 domain 8    │
+│    primary NIC on node 0   (inferred · confirm with lltune nic --live)     │
+└────────────────────────────────────────────────────────────────────────────┘
 {noformat}
 
 {noformat:title=c8a-48xl - core map, NUMA nodes ordered by distance from the NIC}
-  node0   tier 0  NIC-local                                       96 cores
-  [HHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
-  node1   tier 1  remote socket                                   96 cores
-  [HHHIIIISSSSSSSSSSSEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE]
+  node0  ·  tier 0  ·  NIC-local                       96 cores  ·  cpu 0-95
+  ┌───┬───┬───────────┬────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴───────────┴────────────────────────────────────────────────────┘
+   H 0-3  I 4-8  S 9-23  E 24-95
 
-  H housekeeping   I irqnet   S shared (in no cpuset)   E exclusive (isolated)
+  node1  ·  tier 1  ·  remote socket                 96 cores  ·  cpu 96-191
+  ┌───┬───┬───────────┬────────────────────────────────────────────────────┐
+  │HHH│III│SSSSSSSSSSS│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│
+  └───┴───┴───────────┴────────────────────────────────────────────────────┘
+   H 96-99  I 100-104  S 105-119  E 120-191
+
+  H housekeeping    I irqnet    S shared (in no cpuset)    E exclusive (isolated)
+{noformat}
+
+{noformat:title=c8a-48xl - the exclusive pool, ranked by NIC distance}
+  primary NIC on node 0
+  │
+┌─┴────────────────────────────────────┬─────────────────────────────────────┐
+│ tier 0                               │ tier 1                              │
+│ NIC-local                            │ remote socket                       │
+│ node0                                │ node1                               │
+│ 72 exclusive cpu                     │ 72 exclusive cpu                    │
+└──────────────────────────────────────┴─────────────────────────────────────┘
+  nearest                                                             furthest
 {noformat}
 
 ||Role||CPUs||Count||Where it lives||
